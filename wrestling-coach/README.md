@@ -9,9 +9,18 @@ A local-first video analysis app that provides coaching pointers for wrestling t
 - **Target Tracking**: Uses CSRT tracker to follow the selected person through the video
 - **Cropped Pose Analysis**: Runs MediaPipe Pose on the tracked target's ROI for accurate analysis
 - **Auto-Selection Fallback**: If you skip selection, automatically picks the largest/most central person
-- **Rich Feedback**: 8+ metrics analyzed with percentages, thresholds, and evidence
+- **Comprehensive Analysis**: 10+ tips covering stance, motion, entries, shot mechanics, and defense
+- **Wrestling Event Detection**: Automatic detection of level changes, shot attempts, and sprawl defense
+- **Coach's Speech**: AI-generated 8+ sentence coach recap grounded in detected events and metrics
 - **Timeline Events**: See exactly when technique issues occurred during the clip
 - **Annotated Video**: Download video with pose landmarks drawn only on your target
+
+## What's New (v2.2)
+
+- **Wrestling Event Detection**: New event detection for LEVEL_CHANGE, SHOT_ATTEMPT, and SPRAWL_DEFENSE based on pose metric trends
+- **Coach's Speech**: New dedicated summary section with 8+ sentence coach recap referencing tips, metrics, and events
+- **Expanded Tips (10+)**: Now covers posture, head position, reaching/entry distance, lateral motion, trail leg recovery, balance/stability
+- **More Metrics**: Added torso angle, head y-position, wrist forward distance, lateral movement variance, lead/trail leg angles
 
 ## What's New (v2.1)
 
@@ -210,7 +219,7 @@ Analyze the uploaded video with target tracking.
       "title": "Get Lower",
       "why": "Your average knee angle is 152°...",
       "fix": "Bend your knees more...",
-      "evidence": "Avg: 152°, Worst: 168°, Bad frames: 45%",
+      "evidence": "Avg knee angle 152°, worst 168°, 45% frames too high",
       "when": "Occurred at: 2.3s, 5.1s, 8.7s"
     }
   ],
@@ -223,11 +232,19 @@ Analyze the uploaded video with target tracking.
     "elbow_flare": {...},
     "head_position": {...},
     "motion_stability": {"knee_variance": 45.2, "stance_variance": 0.002},
+    "torso_angle": {"avg": 25.3, "pct_too_bent": 15},
+    "lateral_motion": {"variance": 0.005, "is_low": false},
+    "wrist_forward": {"avg": 0.12, "pct_reaching": 10},
     "frames_analyzed": 450
   },
   "timeline": [
     {"timestamp": 2.3, "duration": 1.5, "metric": "knee_angle", "message": "Standing too upright (avg 158°)"}
   ],
+  "events": [
+    {"type": "LEVEL_CHANGE", "t_start": 3.45, "t_end": 3.78, "confidence": 0.72, "description": "Level change detected - hip dropped rapidly with knee bend increase"},
+    {"type": "SHOT_ATTEMPT", "t_start": 4.12, "t_end": 4.65, "confidence": 0.68, "description": "Shot attempt detected - level change with forward penetration"}
+  ],
+  "coach_speech": "Overall, I analyzed 450 frames (about 15.0 seconds) of your wrestling, and there are some clear areas to work on. Your biggest focus area should be 'Get Lower' - this came up repeatedly throughout the clip. I also noticed issues with 'Keep Hands Up' that are limiting your effectiveness and making you vulnerable. Additionally, work on 'Circle More - Stay Active' to round out your positioning. Your average knee angle of 152.0° tells me you're standing too tall - aim for 120-140° to get into a proper athletic stance. I measured your hands dropping an average of 0.145 units below your shoulders - that's leaving you open to attacks. I detected what looks like a shot attempt around the 4.12 second mark with 68% confidence - make sure you're setting that up with motion and level changes first. Focus your drilling on 'Get Lower' and 'Keep Hands Up' - nail those and the other issues will start to correct themselves. Remember, small improvements in stance and positioning compound over time - keep grinding and upload another clip when you've worked on these points.",
   "annotated_video_url": "/api/output/uuid-string"
 }
 ```
@@ -242,6 +259,11 @@ Backend settings in `analysis/pose_analyze.py`:
 | `KNEE_ANGLE_THRESHOLD` | 145° | Angle above which knees are "too straight" |
 | `STANCE_WIDTH_THRESHOLD` | 0.18 | Normalized width below which stance is "narrow" |
 | `HANDS_DROP_THRESHOLD` | 0.10 | Drop amount above which hands are "too low" |
+| `TORSO_ANGLE_TOO_BENT` | 35° | Torso angle indicating excessive waist bend |
+| `REACHING_THRESHOLD` | 0.20 | Wrist forward distance indicating reaching |
+| `LATERAL_MOTION_LOW_THRESHOLD` | 0.01 | Low lateral variance threshold |
+| `LEVEL_CHANGE_HIP_DROP_THRESHOLD` | 0.04 | Hip y drop for level change detection |
+| `SHOT_FORWARD_VELOCITY_THRESHOLD` | 0.03 | Forward velocity for shot detection |
 
 ## Troubleshooting
 
@@ -303,9 +325,11 @@ Make sure the backend is running on port 8000 and the frontend on port 5173.
 6. **Re-acquisition**: If tracker fails, system re-detects persons and matches by IOU
 7. **Cropped Pose**: For each frame, the target's ROI is cropped and expanded 20%, then MediaPipe Pose runs on the crop
 8. **Mapping**: Landmarks are mapped back to full-frame coordinates for drawing
-9. **Analysis**: 8 metrics are computed per frame, then aggregated
-10. **Timeline**: Events where metrics exceed thresholds for >0.5s are recorded
-11. **Feedback**: Top 8 issues are ranked by impact score and returned with evidence
+9. **Metrics**: 15+ metrics computed per frame (knee angle, stance, hands, torso, head position, lateral motion, etc.)
+10. **Timeline Events**: Events where metrics exceed thresholds for >0.5s are recorded
+11. **Wrestling Events**: Level changes, shot attempts, and sprawls detected via pose metric trends (hip drops, forward velocity, stance changes)
+12. **Tips Generation**: Top 10 coaching tips ranked by impact score with evidence, timing, and fixes
+13. **Coach's Speech**: 8+ sentence coach recap generated referencing top tips, specific metrics, and detected events
 
 ## Tech Stack
 
