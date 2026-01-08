@@ -1342,3 +1342,400 @@ def extract_first_frame(video_path: str) -> Tuple[np.ndarray, int, int]:
     
     height, width = frame.shape[:2]
     return frame, width, height
+
+
+def analyze_video_with_anchors(
+    input_path: str,
+    output_path: str,
+    anchors: List[Dict]
+) -> dict:
+    """
+    Main analysis function with anchor-based tracking.
+    
+    Uses user-confirmed anchor points to reinitialize the tracker at key timestamps,
+    preventing drift during overlaps or camera shake.
+    
+    Args:
+        input_path: Path to input video file
+        output_path: Path to write annotated output video
+        anchors: List of anchor dicts: [{t: float, box: {x,y,w,h}|None, skipped: bool}]
+        
+    Returns:
+        Dict with pointers, metrics, timeline, events, tracking_diagnostics
+        
+    Raises:
+        ValueError: If video cannot be opened or has no frames
+    """
+    # Open video
+    cap = cv2.VideoCapture(input_path)
+    
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video file: {input_path}")
+    
+    # Get video properties
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = total_frames / fps if fps > 0 else 0
+    
+    if width == 0 or height == 0:
+        cap.release()
+        raise ValueError("Invalid video dimensions")
+    
+    # Setup video writer
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    
+    if not out.isOpened():
+        cap.release()
+        raise ValueError("Could not create output video writer")
+    
+    # Tracking diagnostics
+    num_reacquires = 0
+    num_segments_skipped = 0
+    frames_with_target = 0
+    total_frames_processed = 0
+    
+    # Aggregation for metrics
+    frame_metrics_list: List[FrameMetrics] = []
+    
+    # Filter anchors to only those with valid box or need processing
+    valid_anchors = [a for a in anchors if not a.get("skipped") or a.get("box")]
+    
+    # If no valid anchors with boxes, try to find at least one starting point
+    start_anchor = None
+    for anchor in anchors:
+        if anchor.get("box") and not anchor.get("skipped"):
+            start_anchor = anchor
+            break
+    
+    if start_anchor is None:
+        # Try to auto-detect at first non-skipped anchor
+        for anchor in anchors:
+            if not anchor.get("skipped"):
+                # Seek to this timestamp and try detection
+                t = anchor.get("t", 0)
+                cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+                ret, frame = cap.read()
+                if ret:
+                    detections = detect_persons(frame)
+                    auto_box = auto_select_target(detections, width, height)
+                    if auto_box:
+                        anchor["box"] = auto_box
+                        start_anchor = anchor
+                        break
+        
+        if start_anchor is None:
+            cap.release()
+            out.release()
+            raise ValueError("No valid anchor with a target box found. Please select yourself in at least one frame.")
+    
+    # Determine time bounds for analysis
+    # Respect MAX_SECONDS cap but allow full clip if anchors span beyond
+    first_anchor_t = anchors[0].get("t", 0) if anchors else 0
+    last_anchor_t = anchors[-1].get("t", duration) if anchors else duration
+    
+    # Cap analysis to MAX_SECONDS from first anchor unless anchors span further
+    max_end_time = min(first_anchor_t + MAX_SECONDS, duration)
+    if last_anchor_t > max_end_time:
+        max_end_time = min(last_anchor_t, duration)
+    
+    # Process video in segments between consecutive anchors
+    with mp_pose.Pose(
+        static_image_mode=False,
+        model_complexity=1,
+        enable_segmentation=False,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5
+    ) as pose:
+        
+        for seg_idx in range(len(anchors) - 1):
+            anchor_start = anchors[seg_idx]
+            anchor_end = anchors[seg_idx + 1]
+            
+            t_start = anchor_start.get("t", 0)
+            t_end = anchor_end.get("t", duration)
+            
+            # Skip segments outside our analysis range
+            if t_start > max_end_time:
+                break
+            
+            # Clamp t_end to max
+            t_end = min(t_end, max_end_time)
+            
+            # Determine start bbox for this segment
+            start_box = None
+            segment_skipped = False
+            
+            if anchor_start.get("box") and not anchor_start.get("skipped"):
+                # Use user-provided box
+                start_box = anchor_start["box"].copy()
+            elif anchor_start.get("skipped"):
+                # User indicated they're not in frame - try YOLO detection
+                cap.set(cv2.CAP_PROP_POS_MSEC, t_start * 1000)
+                ret, frame = cap.read()
+                if ret:
+                    detections = detect_persons(frame)
+                    if detections:
+                        # Use auto-selection
+                        start_box = auto_select_target(detections, width, height)
+                    else:
+                        # No detection - skip this segment
+                        segment_skipped = True
+                        num_segments_skipped += 1
+                else:
+                    segment_skipped = True
+                    num_segments_skipped += 1
+            else:
+                # No box provided and not skipped - try to use previous position or auto-detect
+                cap.set(cv2.CAP_PROP_POS_MSEC, t_start * 1000)
+                ret, frame = cap.read()
+                if ret:
+                    detections = detect_persons(frame)
+                    start_box = auto_select_target(detections, width, height)
+                
+                if not start_box:
+                    segment_skipped = True
+                    num_segments_skipped += 1
+            
+            if segment_skipped:
+                # Write frames without analysis for skipped segment
+                start_frame = int(t_start * fps)
+                end_frame = int(t_end * fps)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+                
+                for frame_idx in range(start_frame, end_frame):
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    
+                    # Draw "NO TARGET" indicator
+                    cv2.putText(frame, "NO TARGET - SKIPPED", (10, 30), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
+                    out.write(frame)
+                    total_frames_processed += 1
+                
+                continue
+            
+            # Validate and clamp start_box
+            start_box["x"] = max(0, min(start_box["x"], width - 10))
+            start_box["y"] = max(0, min(start_box["y"], height - 10))
+            start_box["w"] = max(10, min(start_box["w"], width - start_box["x"]))
+            start_box["h"] = max(10, min(start_box["h"], height - start_box["y"]))
+            
+            # Initialize tracker for this segment
+            start_frame = int(t_start * fps)
+            end_frame = int(t_end * fps)
+            
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            ret, init_frame = cap.read()
+            
+            if not ret:
+                num_segments_skipped += 1
+                continue
+            
+            tracker = TargetTracker(start_box, init_frame)
+            current_box = start_box.copy()
+            
+            # Reset to segment start
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            
+            # Process frames in this segment
+            frame_idx = start_frame
+            while frame_idx < end_frame:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                timestamp = frame_idx / fps
+                
+                # Update tracker
+                if frame_idx == start_frame:
+                    tracking_ok = True
+                    current_box = tracker.get_current_box()
+                else:
+                    tracking_ok, current_box = tracker.update(frame)
+                
+                # Check for tracking failure conditions
+                # 1. Tracker reports failure
+                # 2. Box goes out of frame
+                # 3. Sudden bbox jump (IoU < threshold with previous)
+                needs_reacquire = False
+                
+                if not tracking_ok:
+                    needs_reacquire = True
+                elif (current_box["x"] < 0 or current_box["y"] < 0 or
+                      current_box["x"] + current_box["w"] > width or
+                      current_box["y"] + current_box["h"] > height):
+                    needs_reacquire = True
+                
+                # Attempt reacquisition if needed
+                if needs_reacquire:
+                    detections = detect_persons(frame, confidence_threshold=0.4)
+                    if detections:
+                        from .detection import find_best_match_by_iou
+                        best_match = find_best_match_by_iou(detections, current_box, min_iou=0.1)
+                        if best_match is None:
+                            # No IoU match - use auto selection (nearest to center or largest)
+                            best_match = auto_select_target(detections, width, height)
+                        
+                        if best_match:
+                            current_box = best_match.copy()
+                            tracker = TargetTracker(current_box, frame)
+                            num_reacquires += 1
+                            tracking_ok = True
+                
+                # Draw target box
+                draw_target_box(frame, current_box, tracking_ok)
+                
+                if tracking_ok:
+                    frames_with_target += 1
+                
+                # Expand box for cropping
+                expanded_box = expand_box(current_box, width, height, padding_ratio=0.2)
+                
+                # Crop ROI
+                roi_x, roi_y = expanded_box["x"], expanded_box["y"]
+                roi_w, roi_h = expanded_box["w"], expanded_box["h"]
+                roi = frame[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
+                
+                if roi.size > 0:
+                    # Convert ROI to RGB for MediaPipe
+                    roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+                    results = pose.process(roi_rgb)
+                    
+                    # Process landmarks if detected
+                    if results.pose_landmarks:
+                        # Map landmarks back to full frame coordinates
+                        map_landmarks_to_frame(
+                            results.pose_landmarks,
+                            roi_x, roi_y, roi_w, roi_h,
+                            width, height
+                        )
+                        
+                        # Draw pose landmarks on full frame
+                        mp_drawing.draw_landmarks(
+                            frame,
+                            results.pose_landmarks,
+                            mp_pose.POSE_CONNECTIONS,
+                            landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style()
+                        )
+                        
+                        # Analyze this frame
+                        frame_metrics = analyze_frame_landmarks(results.pose_landmarks, timestamp)
+                        frame_metrics_list.append(frame_metrics)
+                
+                # Write annotated frame
+                out.write(frame)
+                total_frames_processed += 1
+                frame_idx += 1
+            
+            # At segment end, if next anchor has a box, prepare for hard reset
+            # (This will happen automatically in the next iteration's start_box selection)
+    
+    # Process any remaining frames after the last anchor (up to max_end_time)
+    last_anchor_t = anchors[-1].get("t", duration) if anchors else duration
+    if last_anchor_t < max_end_time:
+        # Handle remaining frames (continue with last tracker state)
+        remaining_start = int(last_anchor_t * fps)
+        remaining_end = int(max_end_time * fps)
+        
+        if remaining_start < remaining_end:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, remaining_start)
+            
+            for frame_idx in range(remaining_start, remaining_end):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                timestamp = frame_idx / fps
+                
+                # Try to continue tracking if we have a valid tracker
+                if 'tracker' in dir() and tracker is not None:
+                    tracking_ok, current_box = tracker.update(frame)
+                    draw_target_box(frame, current_box, tracking_ok)
+                    
+                    if tracking_ok:
+                        frames_with_target += 1
+                    
+                    # Pose analysis
+                    expanded_box = expand_box(current_box, width, height, padding_ratio=0.2)
+                    roi_x, roi_y = expanded_box["x"], expanded_box["y"]
+                    roi_w, roi_h = expanded_box["w"], expanded_box["h"]
+                    roi = frame[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
+                    
+                    if roi.size > 0:
+                        roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+                        results = pose.process(roi_rgb)
+                        
+                        if results.pose_landmarks:
+                            map_landmarks_to_frame(
+                                results.pose_landmarks,
+                                roi_x, roi_y, roi_w, roi_h,
+                                width, height
+                            )
+                            
+                            mp_drawing.draw_landmarks(
+                                frame,
+                                results.pose_landmarks,
+                                mp_pose.POSE_CONNECTIONS,
+                                landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style()
+                            )
+                            
+                            frame_metrics = analyze_frame_landmarks(results.pose_landmarks, timestamp)
+                            frame_metrics_list.append(frame_metrics)
+                
+                out.write(frame)
+                total_frames_processed += 1
+    
+    # Cleanup
+    cap.release()
+    out.release()
+    
+    # Check if we got any analyzed frames
+    if not frame_metrics_list:
+        raise ValueError("No pose landmarks detected in video. Ensure a person is visible.")
+    
+    # Compute aggregate metrics
+    aggregate_metrics = compute_aggregate_metrics(frame_metrics_list)
+    
+    # Detect timeline events
+    timeline = detect_timeline_events(frame_metrics_list, fps)
+    
+    # Detect wrestling-specific events
+    wrestling_events = detect_wrestling_events(frame_metrics_list, fps)
+    
+    # Generate rich pointers
+    pointers = generate_rich_pointers(aggregate_metrics, timeline, wrestling_events)
+    
+    # Calculate duration analyzed
+    duration_analyzed = total_frames_processed / fps if fps > 0 else 0
+    
+    # Generate coach's speech
+    coach_speech = generate_coach_speech(
+        aggregate_metrics,
+        pointers,
+        wrestling_events,
+        duration_analyzed
+    )
+    
+    # Calculate tracking diagnostics
+    percent_with_target = (frames_with_target / total_frames_processed * 100) if total_frames_processed > 0 else 0
+    
+    tracking_diagnostics = {
+        "num_reacquires": num_reacquires,
+        "num_segments_skipped": num_segments_skipped,
+        "percent_frames_with_target": round(percent_with_target, 1),
+        "frames_with_target": frames_with_target,
+        "total_frames_processed": total_frames_processed
+    }
+    
+    return {
+        "pointers": pointers,
+        "metrics": aggregate_metrics,
+        "timeline": timeline,
+        "events": wrestling_events,
+        "coach_speech": coach_speech,
+        "tracking_diagnostics": tracking_diagnostics
+    }

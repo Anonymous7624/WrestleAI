@@ -4,6 +4,7 @@ import { AnimatePresence } from 'framer-motion'
 import Header from './components/Header'
 import UploadStep from './components/UploadStep'
 import TargetSelectStep from './components/TargetSelectStep'
+import AnchorSelectStep from './components/AnchorSelectStep'
 import AnalysisStep from './components/AnalysisStep'
 import ResultsStep from './components/ResultsStep'
 
@@ -21,6 +22,7 @@ const STORAGE_KEYS = {
 const STATES = {
   UPLOAD: 'upload',
   TARGET_SELECT: 'target_select',
+  ANCHOR_SELECT: 'anchor_select',  // New anchor-based selection
   ANALYZING: 'analyzing',
   RESULTS: 'results'
 }
@@ -136,14 +138,15 @@ function App() {
       setUploadData(data)
       setUploadComplete(true)
       setIsUploading(false)
-      setAppState(STATES.TARGET_SELECT)
+      // Use anchor selection for better tracking
+      setAppState(STATES.ANCHOR_SELECT)
     } catch (err) {
       setError(err.message || 'Failed to upload video. Is the backend running?')
       setIsUploading(false)
     }
   }
 
-  // Run analysis with selected target
+  // Run analysis with selected target (legacy single-point tracking)
   const handleAnalyze = async (targetBox, tStart) => {
     if (!uploadData) return
 
@@ -186,19 +189,68 @@ function App() {
     }
   }
 
+  // Run analysis with anchor-based tracking (new robust method)
+  const handleAnalyzeWithAnchors = async (anchors) => {
+    if (!uploadData) return
+
+    // Save anchors for retry
+    setLastTarget({ anchors })
+
+    setAppState(STATES.ANALYZING)
+    setError(null)
+    setAnalyzeStarted(true)
+    setAnalyzeComplete(false)
+
+    try {
+      const response = await fetch(`${API_BASE}/api/analyze-with-anchors/${uploadData.job_id}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          anchors: anchors,
+          continuation: false
+        }),
+      })
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}))
+        throw new Error(errorData.detail || `Analysis failed (${response.status})`)
+      }
+
+      const data = await response.json()
+      setResults(data)
+      setAnalyzeComplete(true)
+      
+      // Small delay to show completion state
+      setTimeout(() => {
+        setAppState(STATES.RESULTS)
+      }, 1500)
+    } catch (err) {
+      setError(err.message || 'Failed to analyze video.')
+      setAnalyzeComplete(false)
+    }
+  }
+
   // Retry analysis
   const handleRetry = () => {
     if (lastTarget && uploadData) {
-      handleAnalyze(lastTarget.targetBox, lastTarget.tStart)
+      if (lastTarget.anchors) {
+        // Anchor-based retry
+        handleAnalyzeWithAnchors(lastTarget.anchors)
+      } else {
+        // Legacy single-point retry
+        handleAnalyze(lastTarget.targetBox, lastTarget.tStart)
+      }
     } else {
-      setAppState(STATES.TARGET_SELECT)
+      setAppState(STATES.ANCHOR_SELECT)
       setError(null)
     }
   }
 
   // Go back to target selection
   const handleBackToTarget = () => {
-    setAppState(STATES.TARGET_SELECT)
+    setAppState(STATES.ANCHOR_SELECT)
     setError(null)
   }
 
@@ -254,7 +306,18 @@ function App() {
             />
           )}
 
-          {/* Target Selection Step */}
+          {/* Anchor Selection Step (New - Robust tracking) */}
+          {appState === STATES.ANCHOR_SELECT && uploadData && (
+            <AnchorSelectStep
+              key="anchor"
+              uploadData={uploadData}
+              onAnalyze={handleAnalyzeWithAnchors}
+              onBack={handleNewAnalysis}
+              apiBase={API_BASE}
+            />
+          )}
+
+          {/* Target Selection Step (Legacy - single point) */}
           {appState === STATES.TARGET_SELECT && uploadData && (
             <TargetSelectStep
               key="target"

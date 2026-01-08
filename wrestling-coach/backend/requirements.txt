@@ -11,6 +11,6 @@ torchvision==0.20.1
 # Computer Vision & ML
 opencv-python==4.9.0.80
 opencv-contrib-python==4.9.0.80
-mediapipe==0.10.9
+mediapipe>=0.10.13
 numpy==1.26.3
 ultralytics==8.1.0
