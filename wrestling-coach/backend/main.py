@@ -10,21 +10,96 @@ API Endpoints:
 - GET /api/output/{job_id} - Download annotated video
 """
 
-import os
 import uuid
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, JSONResponse
 
 import cv2
+import numpy as np
 from pydantic import BaseModel
 
 from analysis.pose_analyze import analyze_video
 from analysis.detection import detect_persons, auto_select_target
+
+
+def convert_numpy_types(obj: Any) -> Any:
+    """
+    Recursively convert numpy scalar types and arrays to native Python types.
+    
+    Handles:
+    - np.bool_ -> bool
+    - np.integer (int8, int16, int32, int64, etc.) -> int
+    - np.floating (float16, float32, float64, etc.) -> float
+    - np.ndarray -> list (via .tolist())
+    - dict -> recursively process values
+    - list/tuple -> recursively process elements
+    
+    Args:
+        obj: Any Python object that may contain numpy types
+        
+    Returns:
+        Object with all numpy types converted to native Python types
+    """
+    if obj is None:
+        return None
+    
+    # Handle numpy bool (must check before np.integer since np.bool_ is also integer-like)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    
+    # Handle numpy integers
+    if isinstance(obj, np.integer):
+        return int(obj)
+    
+    # Handle numpy floats
+    if isinstance(obj, np.floating):
+        return float(obj)
+    
+    # Handle numpy arrays
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    
+    # Handle dictionaries - recursively convert values
+    if isinstance(obj, dict):
+        return {key: convert_numpy_types(value) for key, value in obj.items()}
+    
+    # Handle lists - recursively convert elements
+    if isinstance(obj, list):
+        return [convert_numpy_types(item) for item in obj]
+    
+    # Handle tuples - recursively convert elements, return as list for JSON
+    if isinstance(obj, tuple):
+        return [convert_numpy_types(item) for item in obj]
+    
+    # Return other types as-is (str, int, float, bool, etc.)
+    return obj
+
+
+def verify_json_serializable(obj: Any, context: str = "payload") -> bool:
+    """
+    Verify that an object is JSON serializable.
+    Raises ValueError with helpful message if not.
+    
+    Args:
+        obj: Object to verify
+        context: Description for error messages
+        
+    Returns:
+        True if serializable
+        
+    Raises:
+        ValueError: If object cannot be serialized to JSON
+    """
+    try:
+        json.dumps(obj)
+        return True
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"JSON serialization failed for {context}: {e}")
 
 # Create app
 app = FastAPI(title="Wrestling Coach API")
@@ -365,8 +440,8 @@ async def analyze(job_id: str, request: AnalyzeRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
     
-    # Build response
-    return {
+    # Build response payload
+    response_payload = {
         "job_id": job_id,
         "pointers": result["pointers"],
         "metrics": result["metrics"],
@@ -375,6 +450,12 @@ async def analyze(job_id: str, request: AnalyzeRequest):
         "coach_speech": result.get("coach_speech", ""),
         "annotated_video_url": f"/api/output/{job_id}"
     }
+    
+    # Convert all numpy types to native Python types for JSON serialization
+    response_payload = convert_numpy_types(response_payload)
+    
+    # Return as JSONResponse to ensure proper serialization
+    return JSONResponse(content=response_payload)
 
 
 @app.get("/api/output/{job_id}")
@@ -399,6 +480,53 @@ def get_output(job_id: str):
         media_type="video/mp4",
         filename=f"wrestling_analysis_{job_id}.mp4"
     )
+
+
+def _test_numpy_conversion():
+    """
+    Quick sanity check to verify numpy type conversion works correctly.
+    Run with: python -c "from main import _test_numpy_conversion; _test_numpy_conversion()"
+    """
+    test_payload = {
+        "bool_val": np.bool_(True),
+        "int32_val": np.int32(42),
+        "int64_val": np.int64(123456789),
+        "float32_val": np.float32(3.14),
+        "float64_val": np.float64(2.71828),
+        "array_val": np.array([1, 2, 3]),
+        "nested_dict": {
+            "numpy_float": np.float64(99.9),
+            "list_with_numpy": [np.int32(1), np.float32(2.5), np.bool_(False)]
+        },
+        "tuple_val": (np.int32(1), np.float64(2.0)),
+        "none_val": None,
+        "native_int": 123,
+        "native_str": "hello"
+    }
+    
+    converted = convert_numpy_types(test_payload)
+    
+    # Verify JSON serialization works
+    try:
+        json_str = json.dumps(converted)
+        print("✓ JSON serialization successful")
+        print(f"  Result: {json_str[:100]}...")
+    except (TypeError, ValueError) as e:
+        print(f"✗ JSON serialization failed: {e}")
+        return False
+    
+    # Verify types are correct
+    assert isinstance(converted["bool_val"], bool), "bool conversion failed"
+    assert isinstance(converted["int32_val"], int), "int32 conversion failed"
+    assert isinstance(converted["int64_val"], int), "int64 conversion failed"
+    assert isinstance(converted["float32_val"], float), "float32 conversion failed"
+    assert isinstance(converted["float64_val"], float), "float64 conversion failed"
+    assert isinstance(converted["array_val"], list), "array conversion failed"
+    assert isinstance(converted["nested_dict"]["numpy_float"], float), "nested float conversion failed"
+    assert isinstance(converted["tuple_val"], list), "tuple conversion failed"
+    
+    print("✓ All type conversions verified")
+    return True
 
 
 if __name__ == "__main__":
