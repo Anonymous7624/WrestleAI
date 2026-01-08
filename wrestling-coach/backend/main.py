@@ -171,9 +171,12 @@ app.add_middleware(
 BASE_DIR = Path(__file__).resolve().parent
 UPLOADS_DIR = BASE_DIR / "uploads"
 OUTPUTS_DIR = BASE_DIR / "outputs"
-FRAME_CACHE_DIR = BASE_DIR / "frame_cache"
+# Cache directory: backend/cache/frames/
+CACHE_DIR = BASE_DIR / "cache"
+FRAME_CACHE_DIR = CACHE_DIR / "frames"
 UPLOADS_DIR.mkdir(exist_ok=True)
 OUTPUTS_DIR.mkdir(exist_ok=True)
+CACHE_DIR.mkdir(exist_ok=True)
 FRAME_CACHE_DIR.mkdir(exist_ok=True)
 
 # Supported video extensions
@@ -341,6 +344,10 @@ def find_upload_file(job_id: str) -> Path:
     return input_files[0]
 
 
+# Minimum file size for valid cached frame (5KB)
+MIN_CACHE_FILE_SIZE = 5 * 1024
+
+
 def get_frame_cache_path(job_id: str, t_ms: int) -> Path:
     """
     Get the cache path for a frame at a specific timestamp.
@@ -422,7 +429,8 @@ def extract_frame_at_time(
     video_path: str, 
     t_seconds: float, 
     job_id: str,
-    duration: float
+    duration: float,
+    trim_start: float = 0.0
 ) -> Optional[Path]:
     """
     Extract a single frame at the given timestamp using FFmpeg with caching.
@@ -432,30 +440,67 @@ def extract_frame_at_time(
     
     Args:
         video_path: Path to video file
-        t_seconds: Time in seconds
+        t_seconds: Time in seconds (relative to trim_start if trimming)
         job_id: Job ID for cache keying
-        duration: Video duration for clamping
+        duration: Video duration for clamping (effective/trimmed duration)
+        trim_start: Start offset if video is trimmed (default 0.0)
     
     Returns:
         Path to the cached JPEG file, or None if extraction failed
     """
     # Clamp t_seconds to valid range [0, duration]
-    t_seconds = max(0.0, min(t_seconds, duration))
+    clamped_t = max(0.0, min(t_seconds, duration))
     
-    # Convert to milliseconds for stable cache key (preserves decimals)
-    t_ms = round(t_seconds * 1000)
+    # Compute effective time (accounts for trim_start)
+    effective_time = trim_start + clamped_t
     
-    # Check cache first
+    # Convert to milliseconds for stable cache key (integer for consistency)
+    t_ms = int(round(effective_time * 1000))
+    
+    # Get cache path
     cache_path = get_frame_cache_path(job_id, t_ms)
     
-    if cache_path.exists() and cache_path.stat().st_size > 0:
-        logger.debug(f"Cache hit for frame at t={t_seconds}s (t_ms={t_ms})")
-        return cache_path
+    # DEBUG LOGGING: Log requested t, effective_time, t_ms, cache_path
+    logger.info(
+        f"[FRAME DEBUG] job={job_id} requested_t={t_seconds:.3f}s "
+        f"effective_time={effective_time:.3f}s t_ms={t_ms} "
+        f"cache_path={cache_path.name}"
+    )
+    
+    # Check cache first
+    if cache_path.exists():
+        file_size = cache_path.stat().st_size
+        
+        # Verification guard: if file size < 5KB, delete and re-extract
+        if file_size < MIN_CACHE_FILE_SIZE:
+            logger.warning(
+                f"[FRAME DEBUG] Corrupt cache detected (size={file_size}B < {MIN_CACHE_FILE_SIZE}B), "
+                f"deleting and re-extracting: {cache_path.name}"
+            )
+            try:
+                cache_path.unlink()
+            except Exception as e:
+                logger.error(f"Failed to delete corrupt cache file: {e}")
+        else:
+            logger.info(f"[FRAME DEBUG] Cache HIT for {cache_path.name} (size={file_size}B)")
+            return cache_path
     
     # Extract frame using FFmpeg
-    logger.info(f"Extracting frame at t={t_seconds}s for job {job_id}")
+    logger.info(
+        f"[FRAME DEBUG] Cache MISS - extracting frame at effective_time={effective_time:.3f}s "
+        f"for job {job_id}"
+    )
     
-    if extract_frame_with_ffmpeg(video_path, t_seconds, str(cache_path)):
+    if extract_frame_with_ffmpeg(video_path, effective_time, str(cache_path)):
+        # Verify extracted file is valid
+        if cache_path.exists():
+            file_size = cache_path.stat().st_size
+            if file_size < MIN_CACHE_FILE_SIZE:
+                logger.warning(
+                    f"[FRAME DEBUG] Extracted frame too small (size={file_size}B), may be corrupt"
+                )
+            else:
+                logger.info(f"[FRAME DEBUG] Successfully extracted frame (size={file_size}B)")
         return cache_path
     
     return None
@@ -536,7 +581,8 @@ async def upload_video(file: UploadFile = File(...)):
 @app.get("/api/frame/{job_id}")
 async def get_frame(
     job_id: str,
-    t: float = Query(default=0, description="Timestamp in seconds")
+    t: float = Query(default=0, description="Timestamp in seconds"),
+    trim_start: float = Query(default=0.0, description="Trim start offset in seconds (for trimmed videos)")
 ):
     """
     Get a JPEG image of the frame at timestamp t.
@@ -546,7 +592,8 @@ async def get_frame(
     
     Args:
         job_id: Job ID from /api/upload
-        t: Timestamp in seconds (clamped to [0, min(15, duration)])
+        t: Timestamp in seconds (clamped to [0, effective_duration])
+        trim_start: Optional trim start offset for trimmed videos
     
     Returns:
         JPEG image response
@@ -560,27 +607,46 @@ async def get_frame(
     # Find uploaded file
     input_path = find_upload_file(job_id)
     
-    # Get video metadata to determine max time and duration
+    # Get video metadata to determine duration
     try:
         metadata = get_video_metadata(str(input_path))
-        duration = metadata["duration_seconds"]
-        max_t = min(MAX_SCRUB_SECONDS, duration)
+        total_duration = metadata["duration_seconds"]
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"Failed to read video metadata: {str(e)}")
     
-    # Validate and clamp t to valid range [0, max_t]
+    # Calculate effective duration (after trim_start)
+    # If trim_start is provided, effective_duration is the remaining time after trim_start
+    trim_start = max(0.0, min(trim_start, total_duration))
+    effective_duration = total_duration - trim_start
+    
+    # Validate t
     if t < 0:
         raise HTTPException(status_code=400, detail=f"Timestamp must be >= 0, got {t}")
     
-    t = max(0, min(t, max_t))
+    # Clamp t to valid range [0, effective_duration]
+    # NOTE: No longer clamping to MAX_SCRUB_SECONDS (15s) - this was causing the bug!
+    # The clamping is now done properly to the full effective video duration.
+    clamped_t = max(0.0, min(t, effective_duration))
+    
+    logger.info(
+        f"[FRAME API] job={job_id} requested_t={t:.3f}s trim_start={trim_start:.3f}s "
+        f"effective_duration={effective_duration:.3f}s clamped_t={clamped_t:.3f}s"
+    )
     
     # Extract frame using FFmpeg with caching
-    cache_path = extract_frame_at_time(str(input_path), t, job_id, duration)
+    # Pass trim_start so effective_time = trim_start + clamped_t
+    cache_path = extract_frame_at_time(
+        str(input_path), 
+        clamped_t, 
+        job_id, 
+        effective_duration,
+        trim_start=trim_start
+    )
     
     if cache_path is None:
         raise HTTPException(
             status_code=500, 
-            detail=f"Failed to extract frame at t={t}s using FFmpeg"
+            detail=f"Failed to extract frame at t={clamped_t}s using FFmpeg"
         )
     
     # Return the cached JPEG file
@@ -594,7 +660,8 @@ async def get_frame(
 @app.get("/api/boxes/{job_id}")
 async def get_boxes(
     job_id: str,
-    t: float = Query(default=0, description="Timestamp in seconds")
+    t: float = Query(default=0, description="Timestamp in seconds"),
+    trim_start: float = Query(default=0.0, description="Trim start offset in seconds (for trimmed videos)")
 ):
     """
     Get person detection boxes at timestamp t.
@@ -603,7 +670,8 @@ async def get_boxes(
     
     Args:
         job_id: Job ID from /api/upload
-        t: Timestamp in seconds (clamped to [0, min(15, duration)])
+        t: Timestamp in seconds (clamped to [0, effective_duration])
+        trim_start: Optional trim start offset for trimmed videos
     
     Returns:
         List of detection boxes: [{id, x, y, w, h, score}]
@@ -617,26 +685,36 @@ async def get_boxes(
     # Find uploaded file
     input_path = find_upload_file(job_id)
     
-    # Get video metadata to determine max time
+    # Get video metadata to determine duration
     try:
         metadata = get_video_metadata(str(input_path))
-        duration = metadata["duration_seconds"]
-        max_t = min(MAX_SCRUB_SECONDS, duration)
+        total_duration = metadata["duration_seconds"]
         width = metadata["width"]
         height = metadata["height"]
     except ValueError:
         raise HTTPException(status_code=500, detail="Failed to read video metadata")
     
-    # Clamp t to valid range
-    t = max(0, min(t, max_t))
+    # Calculate effective duration (after trim_start)
+    trim_start = max(0.0, min(trim_start, total_duration))
+    effective_duration = total_duration - trim_start
+    
+    # Clamp t to valid range [0, effective_duration]
+    # NOTE: No longer clamping to MAX_SCRUB_SECONDS (15s)
+    clamped_t = max(0.0, min(t, effective_duration))
     
     # Extract frame using FFmpeg with caching (reuses cached frame if available)
-    cache_path = extract_frame_at_time(str(input_path), t, job_id, duration)
+    cache_path = extract_frame_at_time(
+        str(input_path), 
+        clamped_t, 
+        job_id, 
+        effective_duration,
+        trim_start=trim_start
+    )
     
     if cache_path is None:
         raise HTTPException(
             status_code=500, 
-            detail=f"Failed to extract frame at t={t}s using FFmpeg"
+            detail=f"Failed to extract frame at t={clamped_t}s using FFmpeg"
         )
     
     # Read the cached frame as numpy array for YOLO detection
@@ -661,7 +739,7 @@ async def get_boxes(
         "auto_target": auto_target,
         "frame_width": width,
         "frame_height": height,
-        "timestamp": t
+        "timestamp": clamped_t
     }
 
 
