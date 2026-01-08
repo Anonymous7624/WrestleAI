@@ -12,6 +12,9 @@ API Endpoints:
 
 import uuid
 import json
+import os
+import subprocess
+import logging
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
@@ -25,6 +28,13 @@ from pydantic import BaseModel
 
 from analysis.pose_analyze import analyze_video, analyze_video_with_anchors
 from analysis.detection import detect_persons, auto_select_target
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("wrestling-coach")
 
 
 def convert_numpy_types(obj: Any) -> Any:
@@ -101,6 +111,50 @@ def verify_json_serializable(obj: Any, context: str = "payload") -> bool:
     except (TypeError, ValueError) as e:
         raise ValueError(f"JSON serialization failed for {context}: {e}")
 
+# ============================================================================
+# FFmpeg Dependency Check
+# ============================================================================
+
+def check_ffmpeg_available() -> bool:
+    """
+    Check if ffmpeg is available in the system PATH.
+    Returns True if available, raises RuntimeError if not.
+    """
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-version"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode == 0:
+            version_line = result.stdout.split('\n')[0] if result.stdout else "unknown version"
+            logger.info(f"FFmpeg found: {version_line}")
+            return True
+        else:
+            raise RuntimeError("ffmpeg returned non-zero exit code")
+    except FileNotFoundError:
+        raise RuntimeError(
+            "FFmpeg is not installed or not in PATH.\n"
+            "Please install FFmpeg:\n"
+            "  Ubuntu/Debian: sudo apt-get install ffmpeg\n"
+            "  macOS: brew install ffmpeg\n"
+            "  Windows: Download from https://ffmpeg.org/download.html"
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("FFmpeg check timed out. Please verify ffmpeg installation.")
+    except Exception as e:
+        raise RuntimeError(f"FFmpeg check failed: {str(e)}")
+
+
+# Check FFmpeg on module load
+try:
+    check_ffmpeg_available()
+except RuntimeError as e:
+    logger.error(str(e))
+    raise
+
+
 # Create app
 app = FastAPI(title="Wrestling Coach API")
 
@@ -117,8 +171,10 @@ app.add_middleware(
 BASE_DIR = Path(__file__).resolve().parent
 UPLOADS_DIR = BASE_DIR / "uploads"
 OUTPUTS_DIR = BASE_DIR / "outputs"
+FRAME_CACHE_DIR = BASE_DIR / "frame_cache"
 UPLOADS_DIR.mkdir(exist_ok=True)
 OUTPUTS_DIR.mkdir(exist_ok=True)
+FRAME_CACHE_DIR.mkdir(exist_ok=True)
 
 # Supported video extensions
 SUPPORTED_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
@@ -193,12 +249,14 @@ def generate_anchor_timestamps(duration: float) -> list:
     - ~15 anchors by default, up to 30 for videos >= 90s
     - spacing = duration / (N-1), clamped: min 1s, max 10s (max 30s for very long)
     - Always include t=0 and t=duration (or near end)
+    - Always returns SORTED list with NO duplicates
+    - All timestamps are clamped to [0, duration]
     
     Args:
         duration: Video duration in seconds
         
     Returns:
-        List of anchor timestamps in seconds
+        List of anchor timestamps in seconds (sorted, ascending, unique)
     """
     if duration <= 0:
         return [0.0]
@@ -213,7 +271,7 @@ def generate_anchor_timestamps(duration: float) -> list:
     
     # Calculate spacing
     if target_anchors <= 1:
-        return [0.0, duration] if duration > 0 else [0.0]
+        return [0.0, round(min(duration, duration), 2)] if duration > 0 else [0.0]
     
     spacing = duration / (target_anchors - 1)
     
@@ -230,24 +288,26 @@ def generate_anchor_timestamps(duration: float) -> list:
     num_anchors = max(2, int(duration / spacing) + 1)
     
     # Generate timestamps
-    timestamps = []
+    timestamps = set()  # Use set to avoid duplicates
+    timestamps.add(0.0)  # Always include start
+    
     for i in range(num_anchors):
         t = i * spacing
-        if t > duration:
-            break
-        timestamps.append(round(t, 2))
+        # Clamp to [0, duration]
+        t = max(0.0, min(t, duration))
+        timestamps.add(round(t, 2))
     
     # Ensure we include the end (or near end)
-    if timestamps and timestamps[-1] < duration - 0.5:
-        timestamps.append(round(duration, 2))
-    elif not timestamps:
-        timestamps = [0.0, round(duration, 2)] if duration > 0 else [0.0]
+    end_t = round(min(duration, duration), 2)  # Clamp to duration
+    timestamps.add(end_t)
     
-    # Ensure t=0 is first
-    if timestamps[0] != 0.0:
-        timestamps.insert(0, 0.0)
+    # Convert to sorted list
+    result = sorted(timestamps)
     
-    return timestamps
+    # Final validation: ensure all values are within bounds
+    result = [max(0.0, min(t, duration)) for t in result]
+    
+    return result
 
 
 def get_video_metadata(video_path: str) -> dict:
@@ -281,39 +341,141 @@ def find_upload_file(job_id: str) -> Path:
     return input_files[0]
 
 
-def extract_frame_at_time(video_path: str, t_seconds: float, max_t: float = None):
+def get_frame_cache_path(job_id: str, t_ms: int) -> Path:
     """
-    Extract a single frame at the given timestamp.
+    Get the cache path for a frame at a specific timestamp.
+    
+    Args:
+        job_id: The job identifier
+        t_ms: Timestamp in milliseconds (integer for stable cache key)
+    
+    Returns:
+        Path to the cached JPEG file
+    """
+    return FRAME_CACHE_DIR / f"{job_id}_{t_ms}.jpg"
+
+
+def extract_frame_with_ffmpeg(
+    video_path: str, 
+    t_seconds: float, 
+    output_path: str,
+    timeout: int = 30
+) -> bool:
+    """
+    Extract a single frame at the given timestamp using FFmpeg.
+    
+    This avoids OpenCV's CAP_PROP_POS_MSEC seeking issues that can hit
+    the same keyframe repeatedly.
+    
+    Args:
+        video_path: Path to input video file
+        t_seconds: Time in seconds (with decimals)
+        output_path: Path to write the output JPEG
+        timeout: Command timeout in seconds
+    
+    Returns:
+        True if extraction succeeded, False otherwise
+    """
+    # Build FFmpeg command
+    # -ss before -i for fast seeking (input seeking)
+    # -frames:v 1 to extract exactly one frame
+    # -q:v 2 for high quality JPEG
+    # -y to overwrite output
+    cmd = [
+        "ffmpeg",
+        "-ss", f"{t_seconds:.3f}",
+        "-i", video_path,
+        "-frames:v", "1",
+        "-q:v", "2",
+        "-y",
+        output_path
+    ]
+    
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=timeout
+        )
+        
+        if result.returncode != 0:
+            logger.warning(f"FFmpeg frame extraction failed: {result.stderr.decode()[:500]}")
+            return False
+        
+        # Verify output file exists and has content
+        output_file = Path(output_path)
+        if not output_file.exists() or output_file.stat().st_size == 0:
+            logger.warning(f"FFmpeg produced empty or missing output at {output_path}")
+            return False
+        
+        return True
+        
+    except subprocess.TimeoutExpired:
+        logger.error(f"FFmpeg frame extraction timed out for t={t_seconds}s")
+        return False
+    except Exception as e:
+        logger.error(f"FFmpeg frame extraction error: {str(e)}")
+        return False
+
+
+def extract_frame_at_time(
+    video_path: str, 
+    t_seconds: float, 
+    job_id: str,
+    duration: float
+) -> Optional[Path]:
+    """
+    Extract a single frame at the given timestamp using FFmpeg with caching.
+    
+    Uses FFmpeg for reliable frame extraction (avoids OpenCV keyframe issues).
+    Caches extracted frames so repeated requests are fast.
     
     Args:
         video_path: Path to video file
         t_seconds: Time in seconds
-        max_t: Maximum allowed time (clamps t_seconds)
+        job_id: Job ID for cache keying
+        duration: Video duration for clamping
+    
+    Returns:
+        Path to the cached JPEG file, or None if extraction failed
+    """
+    # Clamp t_seconds to valid range [0, duration]
+    t_seconds = max(0.0, min(t_seconds, duration))
+    
+    # Convert to milliseconds for stable cache key (preserves decimals)
+    t_ms = round(t_seconds * 1000)
+    
+    # Check cache first
+    cache_path = get_frame_cache_path(job_id, t_ms)
+    
+    if cache_path.exists() and cache_path.stat().st_size > 0:
+        logger.debug(f"Cache hit for frame at t={t_seconds}s (t_ms={t_ms})")
+        return cache_path
+    
+    # Extract frame using FFmpeg
+    logger.info(f"Extracting frame at t={t_seconds}s for job {job_id}")
+    
+    if extract_frame_with_ffmpeg(video_path, t_seconds, str(cache_path)):
+        return cache_path
+    
+    return None
+
+
+def get_cached_frame_as_numpy(cache_path: Path) -> Optional[np.ndarray]:
+    """
+    Read a cached JPEG frame and return as numpy array (BGR).
+    
+    Args:
+        cache_path: Path to the cached JPEG file
     
     Returns:
         BGR frame as numpy array, or None if failed
     """
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
+    if not cache_path.exists():
         return None
     
-    # Get video info
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    duration = frame_count / fps if fps > 0 else 0
-    
-    # Clamp t_seconds
-    if max_t is not None:
-        t_seconds = min(t_seconds, max_t)
-    t_seconds = max(0, min(t_seconds, duration))
-    
-    # Seek to timestamp
-    cap.set(cv2.CAP_PROP_POS_MSEC, t_seconds * 1000)
-    
-    ret, frame = cap.read()
-    cap.release()
-    
-    return frame if ret else None
+    frame = cv2.imread(str(cache_path))
+    return frame
 
 
 @app.post("/api/upload")
@@ -379,6 +541,9 @@ async def get_frame(
     """
     Get a JPEG image of the frame at timestamp t.
     
+    Uses FFmpeg for reliable frame extraction (avoids OpenCV keyframe issues).
+    Caches extracted frames so repeated requests are fast.
+    
     Args:
         job_id: Job ID from /api/upload
         t: Timestamp in seconds (clamped to [0, min(15, duration)])
@@ -395,29 +560,32 @@ async def get_frame(
     # Find uploaded file
     input_path = find_upload_file(job_id)
     
-    # Get video metadata to determine max time
+    # Get video metadata to determine max time and duration
     try:
         metadata = get_video_metadata(str(input_path))
-        max_t = min(MAX_SCRUB_SECONDS, metadata["duration_seconds"])
-    except ValueError:
-        max_t = MAX_SCRUB_SECONDS
+        duration = metadata["duration_seconds"]
+        max_t = min(MAX_SCRUB_SECONDS, duration)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read video metadata: {str(e)}")
     
-    # Clamp t to valid range
+    # Validate and clamp t to valid range [0, max_t]
+    if t < 0:
+        raise HTTPException(status_code=400, detail=f"Timestamp must be >= 0, got {t}")
+    
     t = max(0, min(t, max_t))
     
-    # Extract frame
-    frame = extract_frame_at_time(str(input_path), t, max_t)
+    # Extract frame using FFmpeg with caching
+    cache_path = extract_frame_at_time(str(input_path), t, job_id, duration)
     
-    if frame is None:
-        raise HTTPException(status_code=500, detail="Failed to extract frame from video")
+    if cache_path is None:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to extract frame at t={t}s using FFmpeg"
+        )
     
-    # Encode as JPEG
-    success, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-    if not success:
-        raise HTTPException(status_code=500, detail="Failed to encode frame as JPEG")
-    
-    return Response(
-        content=buffer.tobytes(),
+    # Return the cached JPEG file
+    return FileResponse(
+        path=str(cache_path),
         media_type="image/jpeg",
         headers={"Cache-Control": "public, max-age=60"}
     )
@@ -430,6 +598,8 @@ async def get_boxes(
 ):
     """
     Get person detection boxes at timestamp t.
+    
+    Reuses the cached JPEG from FFmpeg extraction (does not re-seek video).
     
     Args:
         job_id: Job ID from /api/upload
@@ -450,7 +620,8 @@ async def get_boxes(
     # Get video metadata to determine max time
     try:
         metadata = get_video_metadata(str(input_path))
-        max_t = min(MAX_SCRUB_SECONDS, metadata["duration_seconds"])
+        duration = metadata["duration_seconds"]
+        max_t = min(MAX_SCRUB_SECONDS, duration)
         width = metadata["width"]
         height = metadata["height"]
     except ValueError:
@@ -459,17 +630,27 @@ async def get_boxes(
     # Clamp t to valid range
     t = max(0, min(t, max_t))
     
-    # Extract frame
-    frame = extract_frame_at_time(str(input_path), t, max_t)
+    # Extract frame using FFmpeg with caching (reuses cached frame if available)
+    cache_path = extract_frame_at_time(str(input_path), t, job_id, duration)
+    
+    if cache_path is None:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to extract frame at t={t}s using FFmpeg"
+        )
+    
+    # Read the cached frame as numpy array for YOLO detection
+    frame = get_cached_frame_as_numpy(cache_path)
     
     if frame is None:
-        raise HTTPException(status_code=500, detail="Failed to extract frame from video")
+        raise HTTPException(status_code=500, detail="Failed to read cached frame")
     
-    # Run person detection
+    # Run person detection on the cached frame
     try:
         detections = detect_persons(frame, confidence_threshold=0.5)
     except Exception as e:
         # Detection failure shouldn't be a hard error
+        logger.warning(f"Person detection failed: {str(e)}")
         detections = []
     
     # Also compute auto-selected target
@@ -489,11 +670,13 @@ async def get_anchors(job_id: str):
     """
     Generate anchor timestamps for a video based on duration.
     
+    Always returns a SORTED list of timestamps, never exceeding duration.
+    
     Args:
         job_id: Job ID from /api/upload
     
     Returns:
-        anchors: List of anchor timestamps in seconds
+        anchors: List of anchor timestamps in seconds (sorted, ascending)
         count: Number of anchors
         duration: Video duration in seconds
     """
@@ -517,6 +700,18 @@ async def get_anchors(job_id: str):
     # Generate anchor timestamps
     anchor_timestamps = generate_anchor_timestamps(duration)
     
+    # Ensure anchors are sorted and clamped to [0, duration]
+    anchor_timestamps = sorted(set(anchor_timestamps))  # Sort and deduplicate
+    anchor_timestamps = [
+        round(max(0.0, min(t, duration)), 2) 
+        for t in anchor_timestamps
+    ]
+    
+    # Remove any duplicates that may arise from clamping, keep sorted
+    anchor_timestamps = sorted(set(anchor_timestamps))
+    
+    logger.info(f"Generated {len(anchor_timestamps)} anchors for job {job_id}, duration={duration}s")
+    
     return {
         "anchors": anchor_timestamps,
         "count": len(anchor_timestamps),
@@ -532,6 +727,8 @@ async def analyze(job_id: str, request: AnalyzeRequest):
     """
     Analyze an uploaded video with target tracking.
     
+    Uses atomic output writing: writes to temp file, then renames atomically.
+    
     Args:
         job_id: Job ID from /api/upload
         request: JSON body with:
@@ -544,6 +741,8 @@ async def analyze(job_id: str, request: AnalyzeRequest):
         metrics: Aggregated metrics with percentages
         timeline: List of timestamped events
         annotated_video_url: URL to download annotated video
+        output_ready: True if video is ready for download
+        output_url: URL to download annotated video
     """
     # Validate job_id format
     try:
@@ -553,7 +752,10 @@ async def analyze(job_id: str, request: AnalyzeRequest):
     
     # Find uploaded file
     input_path = find_upload_file(job_id)
-    output_path = OUTPUTS_DIR / f"{job_id}_annotated.mp4"
+    
+    # Define output paths: temp for writing, final for serving
+    temp_output_path = OUTPUTS_DIR / f"{job_id}_annotated.tmp.mp4"
+    final_output_path = OUTPUTS_DIR / f"{job_id}_annotated.mp4"
     
     # Get video metadata
     try:
@@ -589,20 +791,39 @@ async def analyze(job_id: str, request: AnalyzeRequest):
             "clipNumber": request.prior_context.clipNumber or 1
         }
     
-    # Run pose analysis with target tracking
+    logger.info(f"Starting analysis for job {job_id}")
+    
+    # Run pose analysis with target tracking (write to temp path)
+    output_ready = False
     try:
         result = analyze_video(
             str(input_path), 
-            str(output_path), 
+            str(temp_output_path),  # Write to temp path first
             target_box=parsed_target,
             t_start=t_start,
             continuation=request.continuation or False,
             clip_index=request.clip_index,
             prior_context=parsed_prior_context
         )
+        
+        # Atomic rename: only after VideoWriter.release() and file has content
+        if temp_output_path.exists() and temp_output_path.stat().st_size > 0:
+            os.replace(str(temp_output_path), str(final_output_path))
+            output_ready = True
+            logger.info(f"Atomically renamed output for job {job_id}")
+        else:
+            logger.warning(f"Temp output file missing or empty for job {job_id}")
+            
     except ValueError as e:
+        # Clean up temp file on error
+        if temp_output_path.exists():
+            temp_output_path.unlink()
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        # Clean up temp file on error
+        if temp_output_path.exists():
+            temp_output_path.unlink()
+        logger.error(f"Analysis failed for job {job_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
     
     # Build response payload
@@ -614,6 +835,8 @@ async def analyze(job_id: str, request: AnalyzeRequest):
         "events": result.get("events", []),
         "coach_speech": result.get("coach_speech", ""),
         "annotated_video_url": f"/api/output/{job_id}",
+        "output_url": f"/api/output/{job_id}",
+        "output_ready": output_ready,
         "match_context_out": result.get("match_context_out")  # For continuation tracking
     }
     
@@ -633,6 +856,8 @@ async def analyze_with_anchors(job_id: str, request: AnalyzeWithAnchorsRequest):
     to reinitialize the tracker at key timestamps, preventing drift during
     overlaps or camera shake.
     
+    Uses atomic output writing: writes to temp file, then renames atomically.
+    
     Args:
         job_id: Job ID from /api/upload
         request: JSON body with:
@@ -648,6 +873,8 @@ async def analyze_with_anchors(job_id: str, request: AnalyzeWithAnchorsRequest):
         events: Wrestling-specific events (shots, level changes, sprawls)
         tracking_diagnostics: {num_reacquires, num_segments_skipped, percent_frames_with_target}
         annotated_video_url: URL to download annotated video
+        output_ready: True if video is ready for download
+        output_url: URL to download annotated video
     """
     # Validate job_id format
     try:
@@ -657,7 +884,10 @@ async def analyze_with_anchors(job_id: str, request: AnalyzeWithAnchorsRequest):
     
     # Find uploaded file
     input_path = find_upload_file(job_id)
-    output_path = OUTPUTS_DIR / f"{job_id}_annotated.mp4"
+    
+    # Define output paths: temp for writing, final for serving
+    temp_output_path = OUTPUTS_DIR / f"{job_id}_annotated.tmp.mp4"
+    final_output_path = OUTPUTS_DIR / f"{job_id}_annotated.mp4"
     
     # Get video metadata
     try:
@@ -672,27 +902,27 @@ async def analyze_with_anchors(job_id: str, request: AnalyzeWithAnchorsRequest):
         raise HTTPException(status_code=400, detail="At least one anchor is required")
     
     # Convert Pydantic models to dicts and validate
+    # Also ensure anchors are sorted and within duration bounds
     anchors_list = []
     prev_t = -1.0
     for anchor in request.anchors:
-        # Check sorted order
-        if anchor.t <= prev_t:
+        # Clamp anchor timestamp to [0, duration]
+        clamped_t = max(0.0, min(anchor.t, duration))
+        
+        # Check sorted order (after clamping)
+        if clamped_t <= prev_t and prev_t >= 0:
+            # Skip duplicate timestamps that arise from clamping
+            if clamped_t == prev_t:
+                continue
             raise HTTPException(
                 status_code=400, 
                 detail=f"Anchors must be sorted by timestamp. Found {anchor.t} after {prev_t}"
             )
         
-        # Check within bounds
-        if anchor.t < 0 or anchor.t > duration + 0.5:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Anchor timestamp {anchor.t} is outside video duration [0, {duration}]"
-            )
-        
-        prev_t = anchor.t
+        prev_t = clamped_t
         
         anchor_dict = {
-            "t": anchor.t,
+            "t": clamped_t,  # Use clamped value
             "box": None,
             "skipped": anchor.skipped
         }
@@ -707,16 +937,38 @@ async def analyze_with_anchors(job_id: str, request: AnalyzeWithAnchorsRequest):
         
         anchors_list.append(anchor_dict)
     
-    # Run anchor-based analysis
+    if not anchors_list:
+        raise HTTPException(status_code=400, detail="No valid anchors after validation")
+    
+    logger.info(f"Starting anchor-based analysis for job {job_id} with {len(anchors_list)} anchors")
+    
+    # Run anchor-based analysis (write to temp path)
+    output_ready = False
     try:
         result = analyze_video_with_anchors(
             str(input_path),
-            str(output_path),
+            str(temp_output_path),  # Write to temp path first
             anchors=anchors_list
         )
+        
+        # Atomic rename: only after VideoWriter.release() and file has content
+        if temp_output_path.exists() and temp_output_path.stat().st_size > 0:
+            os.replace(str(temp_output_path), str(final_output_path))
+            output_ready = True
+            logger.info(f"Atomically renamed output for job {job_id}")
+        else:
+            logger.warning(f"Temp output file missing or empty for job {job_id}")
+            
     except ValueError as e:
+        # Clean up temp file on error
+        if temp_output_path.exists():
+            temp_output_path.unlink()
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        # Clean up temp file on error
+        if temp_output_path.exists():
+            temp_output_path.unlink()
+        logger.error(f"Analysis failed for job {job_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
     
     # Build response payload
@@ -728,7 +980,9 @@ async def analyze_with_anchors(job_id: str, request: AnalyzeWithAnchorsRequest):
         "events": result.get("events", []),
         "coach_speech": result.get("coach_speech", ""),
         "tracking_diagnostics": result.get("tracking_diagnostics", {}),
-        "annotated_video_url": f"/api/output/{job_id}"
+        "annotated_video_url": f"/api/output/{job_id}",
+        "output_url": f"/api/output/{job_id}",
+        "output_ready": output_ready
     }
     
     # Convert all numpy types to native Python types for JSON serialization
@@ -742,6 +996,9 @@ async def analyze_with_anchors(job_id: str, request: AnalyzeWithAnchorsRequest):
 def get_output(job_id: str):
     """
     Download annotated video by job ID.
+    
+    Only serves the final (atomically renamed) output file.
+    If the file doesn't exist yet (still processing), returns 404 with JSON status.
     """
     # Validate job_id format
     try:
@@ -749,11 +1006,31 @@ def get_output(job_id: str):
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid job ID format")
     
-    # Find output file
+    # Find output file (final path only, not temp)
     output_path = OUTPUTS_DIR / f"{job_id}_annotated.mp4"
+    temp_path = OUTPUTS_DIR / f"{job_id}_annotated.tmp.mp4"
     
     if not output_path.exists():
-        raise HTTPException(status_code=404, detail="Annotated video not found")
+        # Check if temp file exists (still processing)
+        if temp_path.exists():
+            return JSONResponse(
+                status_code=404,
+                content={"status": "processing", "message": "Video is still being generated"}
+            )
+        else:
+            return JSONResponse(
+                status_code=404,
+                content={"status": "not_found", "message": "Annotated video not found"}
+            )
+    
+    # Verify file has content
+    if output_path.stat().st_size == 0:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": "Output video file is empty"}
+        )
+    
+    logger.info(f"Serving output video for job {job_id}")
     
     return FileResponse(
         path=str(output_path),
