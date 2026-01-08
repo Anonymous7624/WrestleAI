@@ -23,7 +23,7 @@ import cv2
 import numpy as np
 from pydantic import BaseModel
 
-from analysis.pose_analyze import analyze_video
+from analysis.pose_analyze import analyze_video, analyze_video_with_anchors
 from analysis.detection import detect_persons, auto_select_target
 
 
@@ -135,20 +135,19 @@ class TargetBox(BaseModel):
     h: int
 
 
-class PriorContext(BaseModel):
-    """
-    Prior context from previous analysis for continuation mode.
-    All fields optional to maintain backward compatibility.
-    """
-    lastTips: Optional[list] = None  # [{title, evidence}, ...]
-    lastEvents: Optional[list] = None  # [{type, timestamp}, ...]
-    lastMetrics: Optional[dict] = None  # {knee_angle_avg, stance_width_avg}
-    coachSpeechSummary: Optional[str] = None
-    totalShotAttempts: Optional[int] = None
-    totalLevelChanges: Optional[int] = None
-    totalSprawls: Optional[int] = None
-    recurringIssues: Optional[dict] = None  # {issue_title: count}
-    clipNumber: Optional[int] = None
+class AnchorBox(BaseModel):
+    """Bounding box for an anchor point"""
+    x: int
+    y: int
+    w: int
+    h: int
+
+
+class Anchor(BaseModel):
+    """Single anchor point with timestamp, optional box, and skip flag"""
+    t: float
+    box: Optional[AnchorBox] = None
+    skipped: bool = False
 
 
 class AnalyzeRequest(BaseModel):
@@ -160,10 +159,82 @@ class AnalyzeRequest(BaseModel):
     prior_context: Optional[PriorContext] = None
 
 
+class AnalyzeWithAnchorsRequest(BaseModel):
+    """Request body for anchor-based analysis"""
+    anchors: list[Anchor]
+    continuation: bool = False
+    prior_context: Optional[dict] = None
+
+
 @app.get("/")
 def root():
     """Health check endpoint"""
     return {"status": "ok", "service": "wrestling-coach-api"}
+
+
+def generate_anchor_timestamps(duration: float) -> list:
+    """
+    Generate anchor timestamps for a video based on duration.
+    
+    Rules:
+    - ~15 anchors by default, up to 30 for videos >= 90s
+    - spacing = duration / (N-1), clamped: min 1s, max 10s (max 30s for very long)
+    - Always include t=0 and t=duration (or near end)
+    
+    Args:
+        duration: Video duration in seconds
+        
+    Returns:
+        List of anchor timestamps in seconds
+    """
+    if duration <= 0:
+        return [0.0]
+    
+    # Determine number of anchors based on duration
+    if duration >= 90:
+        # For long clips, use up to 30 anchors
+        target_anchors = min(30, max(15, int(duration / 3)))
+    else:
+        # Default ~15 anchors
+        target_anchors = 15
+    
+    # Calculate spacing
+    if target_anchors <= 1:
+        return [0.0, duration] if duration > 0 else [0.0]
+    
+    spacing = duration / (target_anchors - 1)
+    
+    # Clamp spacing
+    min_spacing = 1.0  # minimum 1 second
+    max_spacing = 10.0  # maximum 10 seconds (30s allowed for very long videos)
+    
+    if duration > 300:  # > 5 minutes
+        max_spacing = 30.0
+    
+    spacing = max(min_spacing, min(spacing, max_spacing))
+    
+    # Recalculate number of anchors based on clamped spacing
+    num_anchors = max(2, int(duration / spacing) + 1)
+    
+    # Generate timestamps
+    timestamps = []
+    for i in range(num_anchors):
+        t = i * spacing
+        if t > duration:
+            break
+        timestamps.append(round(t, 2))
+    
+    # Ensure we include the end (or near end)
+    if timestamps and timestamps[-1] < duration - 0.5:
+        timestamps.append(round(duration, 2))
+    elif not timestamps:
+        timestamps = [0.0, round(duration, 2)] if duration > 0 else [0.0]
+    
+    # Ensure t=0 is first
+    if timestamps[0] != 0.0:
+        timestamps.insert(0, 0.0)
+    
+    return timestamps
 
 
 def get_video_metadata(video_path: str) -> dict:
@@ -400,6 +471,49 @@ async def get_boxes(
     }
 
 
+@app.get("/api/anchors/{job_id}")
+async def get_anchors(job_id: str):
+    """
+    Generate anchor timestamps for a video based on duration.
+    
+    Args:
+        job_id: Job ID from /api/upload
+    
+    Returns:
+        anchors: List of anchor timestamps in seconds
+        count: Number of anchors
+        duration: Video duration in seconds
+    """
+    # Validate job_id format
+    try:
+        uuid.UUID(job_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid job ID format")
+    
+    # Find uploaded file
+    input_path = find_upload_file(job_id)
+    
+    # Get video metadata
+    try:
+        metadata = get_video_metadata(str(input_path))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    
+    duration = metadata["duration_seconds"]
+    
+    # Generate anchor timestamps
+    anchor_timestamps = generate_anchor_timestamps(duration)
+    
+    return {
+        "anchors": anchor_timestamps,
+        "count": len(anchor_timestamps),
+        "duration": duration,
+        "fps": metadata["fps"],
+        "width": metadata["width"],
+        "height": metadata["height"]
+    }
+
+
 @app.post("/api/analyze/{job_id}")
 async def analyze(job_id: str, request: AnalyzeRequest):
     """
@@ -488,6 +602,120 @@ async def analyze(job_id: str, request: AnalyzeRequest):
         "coach_speech": result.get("coach_speech", ""),
         "annotated_video_url": f"/api/output/{job_id}",
         "match_context_out": result.get("match_context_out")  # For continuation tracking
+    }
+    
+    # Convert all numpy types to native Python types for JSON serialization
+    response_payload = convert_numpy_types(response_payload)
+    
+    # Return as JSONResponse to ensure proper serialization
+    return JSONResponse(content=response_payload)
+
+
+@app.post("/api/analyze-with-anchors/{job_id}")
+async def analyze_with_anchors(job_id: str, request: AnalyzeWithAnchorsRequest):
+    """
+    Analyze an uploaded video using anchor-based tracking.
+    
+    This provides more robust tracking by using user-confirmed anchor points
+    to reinitialize the tracker at key timestamps, preventing drift during
+    overlaps or camera shake.
+    
+    Args:
+        job_id: Job ID from /api/upload
+        request: JSON body with:
+            - anchors: Array of {t: float, box: {x,y,w,h} | null, skipped: bool}
+            - continuation: Optional bool for continuing prior analysis
+            - prior_context: Optional object with prior analysis context
+    
+    Returns:
+        job_id: Same job ID
+        pointers: List of coaching pointers (top 8-10)
+        metrics: Aggregated metrics with percentages
+        timeline: List of timestamped events
+        events: Wrestling-specific events (shots, level changes, sprawls)
+        tracking_diagnostics: {num_reacquires, num_segments_skipped, percent_frames_with_target}
+        annotated_video_url: URL to download annotated video
+    """
+    # Validate job_id format
+    try:
+        uuid.UUID(job_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid job ID format")
+    
+    # Find uploaded file
+    input_path = find_upload_file(job_id)
+    output_path = OUTPUTS_DIR / f"{job_id}_annotated.mp4"
+    
+    # Get video metadata
+    try:
+        metadata = get_video_metadata(str(input_path))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    
+    duration = metadata["duration_seconds"]
+    
+    # Validate anchors
+    if not request.anchors:
+        raise HTTPException(status_code=400, detail="At least one anchor is required")
+    
+    # Convert Pydantic models to dicts and validate
+    anchors_list = []
+    prev_t = -1.0
+    for anchor in request.anchors:
+        # Check sorted order
+        if anchor.t <= prev_t:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Anchors must be sorted by timestamp. Found {anchor.t} after {prev_t}"
+            )
+        
+        # Check within bounds
+        if anchor.t < 0 or anchor.t > duration + 0.5:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Anchor timestamp {anchor.t} is outside video duration [0, {duration}]"
+            )
+        
+        prev_t = anchor.t
+        
+        anchor_dict = {
+            "t": anchor.t,
+            "box": None,
+            "skipped": anchor.skipped
+        }
+        
+        if anchor.box is not None:
+            anchor_dict["box"] = {
+                "x": anchor.box.x,
+                "y": anchor.box.y,
+                "w": anchor.box.w,
+                "h": anchor.box.h
+            }
+        
+        anchors_list.append(anchor_dict)
+    
+    # Run anchor-based analysis
+    try:
+        result = analyze_video_with_anchors(
+            str(input_path),
+            str(output_path),
+            anchors=anchors_list
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+    
+    # Build response payload
+    response_payload = {
+        "job_id": job_id,
+        "pointers": result["pointers"],
+        "metrics": result["metrics"],
+        "timeline": result.get("timeline", []),
+        "events": result.get("events", []),
+        "coach_speech": result.get("coach_speech", ""),
+        "tracking_diagnostics": result.get("tracking_diagnostics", {}),
+        "annotated_video_url": f"/api/output/{job_id}"
     }
     
     # Convert all numpy types to native Python types for JSON serialization
