@@ -1,6 +1,6 @@
 """
 Pose Analysis Module for Wrestling Coach
-Uses MediaPipe Pose to analyze wrestling technique from video.
+Uses MediaPipe Tasks PoseLandmarker to analyze wrestling technique from video.
 Now with target tracking, cropped pose analysis, and wrestling event detection.
 """
 
@@ -9,15 +9,16 @@ from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass, field
 import cv2
 import mediapipe as mp
+from mediapipe.tasks import python as mp_tasks
+from mediapipe.tasks.python import vision as mp_vision
 import numpy as np
 
 from .tracking import TargetTracker, expand_box
 from .detection import detect_persons, auto_select_target
+from .model_utils import get_pose_model_path
 
-# MediaPipe Pose setup
-mp_pose = mp.solutions.pose
-mp_drawing = mp.solutions.drawing_utils
-mp_drawing_styles = mp.solutions.drawing_styles
+# Get pose landmark connections from Tasks API
+POSE_CONNECTIONS = mp_vision.PoseLandmarksConnections.POSE_LANDMARKS
 
 # Pose landmark indices (from MediaPipe)
 NOSE = 0
@@ -61,6 +62,119 @@ STANCE_WOBBLE_THRESHOLD = 0.003  # High variance in stance width
 
 # Backend setting: max seconds to analyze
 MAX_SECONDS = 20
+
+
+def create_pose_landmarker(
+    running_mode: mp_vision.RunningMode = mp_vision.RunningMode.VIDEO,
+    num_poses: int = 1,
+    min_detection_confidence: float = 0.5,
+    min_tracking_confidence: float = 0.5
+) -> mp_vision.PoseLandmarker:
+    """
+    Create a PoseLandmarker instance using the MediaPipe Tasks API.
+    
+    Args:
+        running_mode: VIDEO for frame-by-frame processing, IMAGE for single images
+        num_poses: Maximum number of poses to detect (1 since we track a single wrestler)
+        min_detection_confidence: Minimum confidence for pose detection
+        min_tracking_confidence: Minimum confidence for pose tracking
+        
+    Returns:
+        Configured PoseLandmarker instance
+    """
+    model_path = get_pose_model_path()
+    
+    base_options = mp_tasks.BaseOptions(model_asset_path=model_path)
+    
+    options = mp_vision.PoseLandmarkerOptions(
+        base_options=base_options,
+        running_mode=running_mode,
+        num_poses=num_poses,
+        min_pose_detection_confidence=min_detection_confidence,
+        min_pose_presence_confidence=min_detection_confidence,
+        min_tracking_confidence=min_tracking_confidence,
+        output_segmentation_masks=False
+    )
+    
+    return mp_vision.PoseLandmarker.create_from_options(options)
+
+
+def draw_pose_landmarks(
+    frame: np.ndarray,
+    pose_landmarks,
+    connections=None,
+    landmark_color: Tuple[int, int, int] = (0, 255, 0),
+    connection_color: Tuple[int, int, int] = (255, 255, 255),
+    landmark_radius: int = 5,
+    connection_thickness: int = 2,
+    min_visibility: float = 0.5
+):
+    """
+    Draw pose landmarks and connections on a frame.
+    
+    Custom drawing function for MediaPipe Tasks API landmarks since
+    the legacy mp.solutions.drawing_utils is no longer available.
+    
+    Args:
+        frame: BGR image as numpy array
+        pose_landmarks: List of NormalizedLandmark from PoseLandmarker
+        connections: Optional set of (start, end) tuples for connections
+        landmark_color: BGR color for landmarks
+        connection_color: BGR color for connections
+        landmark_radius: Radius of landmark circles
+        connection_thickness: Thickness of connection lines
+        min_visibility: Minimum visibility threshold for drawing
+    """
+    if pose_landmarks is None:
+        return
+    
+    height, width = frame.shape[:2]
+    
+    # Use default connections if not provided
+    if connections is None:
+        connections = POSE_CONNECTIONS
+    
+    # Draw connections first (so landmarks are on top)
+    for connection in connections:
+        start_idx = connection.start
+        end_idx = connection.end
+        
+        if start_idx >= len(pose_landmarks) or end_idx >= len(pose_landmarks):
+            continue
+        
+        start_lm = pose_landmarks[start_idx]
+        end_lm = pose_landmarks[end_idx]
+        
+        # Check visibility
+        start_vis = getattr(start_lm, 'visibility', 1.0)
+        end_vis = getattr(end_lm, 'visibility', 1.0)
+        
+        if start_vis < min_visibility or end_vis < min_visibility:
+            continue
+        
+        # Convert normalized coords to pixel coords
+        start_x = int(start_lm.x * width)
+        start_y = int(start_lm.y * height)
+        end_x = int(end_lm.x * width)
+        end_y = int(end_lm.y * height)
+        
+        # Draw connection line
+        cv2.line(frame, (start_x, start_y), (end_x, end_y), 
+                connection_color, connection_thickness)
+    
+    # Draw landmarks
+    for lm in pose_landmarks:
+        visibility = getattr(lm, 'visibility', 1.0)
+        if visibility < min_visibility:
+            continue
+        
+        x = int(lm.x * width)
+        y = int(lm.y * height)
+        
+        # Draw filled circle for landmark
+        cv2.circle(frame, (x, y), landmark_radius, landmark_color, -1)
+        # Draw outline for better visibility
+        cv2.circle(frame, (x, y), landmark_radius, (0, 0, 0), 1)
 
 
 @dataclass
@@ -122,9 +236,24 @@ def calculate_angle(a: tuple, b: tuple, c: tuple) -> float:
 
 
 def get_landmark_coords(landmarks, idx: int, min_visibility: float = 0.5) -> Optional[tuple]:
-    """Get (x, y) coordinates for a landmark if visible."""
-    lm = landmarks.landmark[idx]
-    if lm.visibility < min_visibility:
+    """
+    Get (x, y) coordinates for a landmark if visible.
+    
+    Works with both:
+    - Legacy protobuf format (NormalizedLandmarkList with .landmark attribute)
+    - Tasks API format (list of NormalizedLandmark objects)
+    """
+    # Handle both Tasks API list format and legacy protobuf format
+    if hasattr(landmarks, 'landmark'):
+        # Legacy protobuf format
+        lm = landmarks.landmark[idx]
+    else:
+        # Tasks API list format
+        lm = landmarks[idx]
+    
+    # Get visibility (may be stored differently)
+    visibility = getattr(lm, 'visibility', 1.0)
+    if visibility < min_visibility:
         return None
     return (lm.x, lm.y)
 
@@ -1137,8 +1266,15 @@ def map_landmarks_to_frame(
     """
     Map ROI-relative landmarks back to full-frame coordinates.
     Modifies landmarks in-place.
+    
+    Works with both:
+    - Legacy protobuf format (NormalizedLandmarkList with .landmark attribute)
+    - Tasks API format (list of NormalizedLandmark objects)
     """
-    for landmark in landmarks.landmark:
+    # Handle both formats
+    landmark_list = landmarks.landmark if hasattr(landmarks, 'landmark') else landmarks
+    
+    for landmark in landmark_list:
         # Convert from ROI normalized coords to absolute coords
         abs_x = roi_x + landmark.x * roi_w
         abs_y = roi_y + landmark.y * roi_h
@@ -1255,15 +1391,14 @@ def analyze_video(
     # Reset to start position for processing
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     
-    # Process frames with MediaPipe Pose
-    with mp_pose.Pose(
-        static_image_mode=False,
-        model_complexity=1,
-        enable_segmentation=False,
+    # Create PoseLandmarker using Tasks API
+    pose_landmarker = create_pose_landmarker(
+        running_mode=mp_vision.RunningMode.VIDEO,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5
-    ) as pose:
-        
+    )
+    
+    try:
         frame_count = 0
         while cap.isOpened() and frame_count < max_frames_to_process:
             ret, frame = cap.read()
@@ -1272,6 +1407,7 @@ def analyze_video(
             
             # Calculate timestamp relative to video start (not t_start)
             timestamp = t_start + (frame_count / fps)
+            timestamp_ms = int(timestamp * 1000)
             frame_count += 1
             
             # Update tracker
@@ -1297,33 +1433,37 @@ def analyze_video(
                 out.write(frame)
                 continue
             
-            # Convert ROI to RGB for MediaPipe
+            # Convert ROI to RGB for MediaPipe Tasks API
             roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-            results = pose.process(roi_rgb)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=roi_rgb)
             
-            # Process landmarks if detected
-            if results.pose_landmarks:
+            # Run pose detection using Tasks API
+            results = pose_landmarker.detect_for_video(mp_image, timestamp_ms)
+            
+            # Process landmarks if detected (Tasks API returns list of poses)
+            if results.pose_landmarks and len(results.pose_landmarks) > 0:
+                # Get first detected pose landmarks
+                pose_landmarks = results.pose_landmarks[0]
+                
                 # Map landmarks back to full frame coordinates
                 map_landmarks_to_frame(
-                    results.pose_landmarks,
+                    pose_landmarks,
                     roi_x, roi_y, roi_w, roi_h,
                     width, height
                 )
                 
                 # Draw pose landmarks on full frame
-                mp_drawing.draw_landmarks(
-                    frame,
-                    results.pose_landmarks,
-                    mp_pose.POSE_CONNECTIONS,
-                    landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style()
-                )
+                draw_pose_landmarks(frame, pose_landmarks)
                 
-                # Analyze this frame
-                frame_metrics = analyze_frame_landmarks(results.pose_landmarks, timestamp)
+                # Analyze this frame (pass the list format)
+                frame_metrics = analyze_frame_landmarks(pose_landmarks, timestamp)
                 frame_metrics_list.append(frame_metrics)
             
             # Write annotated frame
             out.write(frame)
+    finally:
+        # Close the pose landmarker
+        pose_landmarker.close()
     
     # Cleanup
     cap.release()
@@ -1533,15 +1673,14 @@ def analyze_video_with_anchors(
     if last_anchor_t > max_end_time:
         max_end_time = min(last_anchor_t, duration)
     
-    # Process video in segments between consecutive anchors
-    with mp_pose.Pose(
-        static_image_mode=False,
-        model_complexity=1,
-        enable_segmentation=False,
+    # Create PoseLandmarker using Tasks API
+    pose_landmarker = create_pose_landmarker(
+        running_mode=mp_vision.RunningMode.VIDEO,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5
-    ) as pose:
-        
+    )
+    
+    try:
         for seg_idx in range(len(anchors) - 1):
             anchor_start = anchors[seg_idx]
             anchor_end = anchors[seg_idx + 1]
@@ -1693,29 +1832,31 @@ def analyze_video_with_anchors(
                 roi = frame[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
                 
                 if roi.size > 0:
-                    # Convert ROI to RGB for MediaPipe
+                    # Convert ROI to RGB for MediaPipe Tasks API
                     roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-                    results = pose.process(roi_rgb)
+                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=roi_rgb)
                     
-                    # Process landmarks if detected
-                    if results.pose_landmarks:
+                    # Use timestamp in milliseconds for video mode
+                    timestamp_ms = int(timestamp * 1000)
+                    results = pose_landmarker.detect_for_video(mp_image, timestamp_ms)
+                    
+                    # Process landmarks if detected (Tasks API returns list of poses)
+                    if results.pose_landmarks and len(results.pose_landmarks) > 0:
+                        # Get first detected pose landmarks
+                        pose_landmarks = results.pose_landmarks[0]
+                        
                         # Map landmarks back to full frame coordinates
                         map_landmarks_to_frame(
-                            results.pose_landmarks,
+                            pose_landmarks,
                             roi_x, roi_y, roi_w, roi_h,
                             width, height
                         )
                         
                         # Draw pose landmarks on full frame
-                        mp_drawing.draw_landmarks(
-                            frame,
-                            results.pose_landmarks,
-                            mp_pose.POSE_CONNECTIONS,
-                            landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style()
-                        )
+                        draw_pose_landmarks(frame, pose_landmarks)
                         
                         # Analyze this frame
-                        frame_metrics = analyze_frame_landmarks(results.pose_landmarks, timestamp)
+                        frame_metrics = analyze_frame_landmarks(pose_landmarks, timestamp)
                         frame_metrics_list.append(frame_metrics)
                 
                 # Write annotated frame
@@ -1726,60 +1867,63 @@ def analyze_video_with_anchors(
             # At segment end, if next anchor has a box, prepare for hard reset
             # (This will happen automatically in the next iteration's start_box selection)
     
-    # Process any remaining frames after the last anchor (up to max_end_time)
-    last_anchor_t = anchors[-1].get("t", duration) if anchors else duration
-    if last_anchor_t < max_end_time:
-        # Handle remaining frames (continue with last tracker state)
-        remaining_start = int(last_anchor_t * fps)
-        remaining_end = int(max_end_time * fps)
-        
-        if remaining_start < remaining_end:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, remaining_start)
+        # Process any remaining frames after the last anchor (up to max_end_time)
+        last_anchor_t = anchors[-1].get("t", duration) if anchors else duration
+        if last_anchor_t < max_end_time:
+            # Handle remaining frames (continue with last tracker state)
+            remaining_start = int(last_anchor_t * fps)
+            remaining_end = int(max_end_time * fps)
             
-            for frame_idx in range(remaining_start, remaining_end):
-                ret, frame = cap.read()
-                if not ret:
-                    break
+            if remaining_start < remaining_end:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, remaining_start)
                 
-                timestamp = frame_idx / fps
-                
-                # Try to continue tracking if we have a valid tracker
-                if 'tracker' in dir() and tracker is not None:
-                    tracking_ok, current_box = tracker.update(frame)
-                    draw_target_box(frame, current_box, tracking_ok)
+                for frame_idx in range(remaining_start, remaining_end):
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
                     
-                    if tracking_ok:
-                        frames_with_target += 1
+                    timestamp = frame_idx / fps
+                    timestamp_ms = int(timestamp * 1000)
                     
-                    # Pose analysis
-                    expanded_box = expand_box(current_box, width, height, padding_ratio=0.2)
-                    roi_x, roi_y = expanded_box["x"], expanded_box["y"]
-                    roi_w, roi_h = expanded_box["w"], expanded_box["h"]
-                    roi = frame[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
-                    
-                    if roi.size > 0:
-                        roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-                        results = pose.process(roi_rgb)
+                    # Try to continue tracking if we have a valid tracker
+                    if 'tracker' in dir() and tracker is not None:
+                        tracking_ok, current_box = tracker.update(frame)
+                        draw_target_box(frame, current_box, tracking_ok)
                         
-                        if results.pose_landmarks:
-                            map_landmarks_to_frame(
-                                results.pose_landmarks,
-                                roi_x, roi_y, roi_w, roi_h,
-                                width, height
-                            )
+                        if tracking_ok:
+                            frames_with_target += 1
+                        
+                        # Pose analysis
+                        expanded_box = expand_box(current_box, width, height, padding_ratio=0.2)
+                        roi_x, roi_y = expanded_box["x"], expanded_box["y"]
+                        roi_w, roi_h = expanded_box["w"], expanded_box["h"]
+                        roi = frame[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
+                        
+                        if roi.size > 0:
+                            roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+                            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=roi_rgb)
+                            results = pose_landmarker.detect_for_video(mp_image, timestamp_ms)
                             
-                            mp_drawing.draw_landmarks(
-                                frame,
-                                results.pose_landmarks,
-                                mp_pose.POSE_CONNECTIONS,
-                                landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style()
-                            )
-                            
-                            frame_metrics = analyze_frame_landmarks(results.pose_landmarks, timestamp)
-                            frame_metrics_list.append(frame_metrics)
-                
-                out.write(frame)
-                total_frames_processed += 1
+                            if results.pose_landmarks and len(results.pose_landmarks) > 0:
+                                pose_landmarks = results.pose_landmarks[0]
+                                
+                                map_landmarks_to_frame(
+                                    pose_landmarks,
+                                    roi_x, roi_y, roi_w, roi_h,
+                                    width, height
+                                )
+                                
+                                # Draw pose landmarks on full frame
+                                draw_pose_landmarks(frame, pose_landmarks)
+                                
+                                frame_metrics = analyze_frame_landmarks(pose_landmarks, timestamp)
+                                frame_metrics_list.append(frame_metrics)
+                    
+                    out.write(frame)
+                    total_frames_processed += 1
+    finally:
+        # Close the pose landmarker
+        pose_landmarker.close()
     
     # Cleanup
     cap.release()
