@@ -13,7 +13,7 @@ API Endpoints:
 import uuid
 import json
 from pathlib import Path
-from typing import Optional, Any
+from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -148,6 +148,19 @@ class Anchor(BaseModel):
     t: float
     box: Optional[AnchorBox] = None
     skipped: bool = False
+
+
+class PriorContext(BaseModel):
+    """Context from prior analysis for continuation mode"""
+    lastTips: Optional[List[str]] = None
+    lastEvents: Optional[List[Dict[str, Any]]] = None
+    lastMetrics: Optional[Dict[str, Any]] = None
+    coachSpeechSummary: Optional[str] = None
+    totalShotAttempts: Optional[int] = None
+    totalLevelChanges: Optional[int] = None
+    totalSprawls: Optional[int] = None
+    recurringIssues: Optional[Dict[str, Any]] = None
+    clipNumber: Optional[int] = None
 
 
 class AnalyzeRequest(BaseModel):
