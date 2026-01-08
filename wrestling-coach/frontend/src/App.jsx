@@ -18,13 +18,24 @@ function App() {
   const [error, setError] = useState(null)
   const [results, setResults] = useState(null)
   
-  // Target selection state
+  // Upload metadata state
   const [uploadData, setUploadData] = useState(null)
+  
+  // Target selection state
+  const [currentTime, setCurrentTime] = useState(0)
+  const [maxTime, setMaxTime] = useState(15)
+  const [frameUrl, setFrameUrl] = useState(null)
+  const [boxes, setBoxes] = useState([])
+  const [frameWidth, setFrameWidth] = useState(0)
+  const [frameHeight, setFrameHeight] = useState(0)
   const [selectedTarget, setSelectedTarget] = useState(null)
+  const [autoTarget, setAutoTarget] = useState(null)
   const [imageSize, setImageSize] = useState({ width: 0, height: 0 })
+  const [loadingFrame, setLoadingFrame] = useState(false)
   
   const fileInputRef = useRef(null)
   const previewImageRef = useRef(null)
+  const sliderDebounceRef = useRef(null)
 
   // Handle file selection
   const handleFileSelect = (selectedFile) => {
@@ -43,6 +54,7 @@ function App() {
       setResults(null)
       setUploadData(null)
       setSelectedTarget(null)
+      setCurrentTime(0)
     }
   }
 
@@ -72,7 +84,44 @@ function App() {
     handleFileSelect(e.target.files[0])
   }
 
-  // Upload video and get detections
+  // Fetch frame and boxes for current time
+  const fetchFrameAndBoxes = useCallback(async (jobId, t) => {
+    setLoadingFrame(true)
+    try {
+      // Fetch frame image
+      const frameResponse = await fetch(`${API_BASE}/api/frame/${jobId}?t=${t}`)
+      if (frameResponse.ok) {
+        const blob = await frameResponse.blob()
+        const url = URL.createObjectURL(blob)
+        // Revoke previous URL to avoid memory leaks
+        if (frameUrl) {
+          URL.revokeObjectURL(frameUrl)
+        }
+        setFrameUrl(url)
+      }
+      
+      // Fetch boxes
+      const boxesResponse = await fetch(`${API_BASE}/api/boxes/${jobId}?t=${t}`)
+      if (boxesResponse.ok) {
+        const data = await boxesResponse.json()
+        setBoxes(data.boxes || [])
+        setAutoTarget(data.auto_target)
+        setFrameWidth(data.frame_width)
+        setFrameHeight(data.frame_height)
+        
+        // If no target selected yet, pre-select auto target
+        if (!selectedTarget && data.auto_target) {
+          setSelectedTarget(data.auto_target)
+        }
+      }
+    } catch (err) {
+      console.error('Failed to fetch frame/boxes:', err)
+    } finally {
+      setLoadingFrame(false)
+    }
+  }, [frameUrl, selectedTarget])
+
+  // Upload video and get metadata
   const handleUpload = async () => {
     if (!file) return
 
@@ -96,36 +145,58 @@ function App() {
       const data = await response.json()
       setUploadData(data)
       
-      // If we have detections, show target selection
-      if (data.detections && data.detections.length > 0) {
-        // Pre-select auto target
-        setSelectedTarget(data.auto_target)
-        setAppState(STATES.TARGET_SELECT)
-      } else {
-        // No detections - proceed with auto mode
-        await runAnalysis(data.job_id, null)
-      }
+      // Calculate max scrub time (min of 15 seconds or video duration)
+      const maxT = Math.min(15, data.duration_seconds)
+      setMaxTime(maxT)
+      setCurrentTime(0)
+      
+      // Fetch initial frame and boxes
+      await fetchFrameAndBoxes(data.job_id, 0)
+      
+      setAppState(STATES.TARGET_SELECT)
     } catch (err) {
       setError(err.message || 'Failed to upload video. Is the backend running?')
       setAppState(STATES.UPLOAD)
     }
   }
 
+  // Handle slider change with debouncing
+  const handleSliderChange = (e) => {
+    const newTime = parseFloat(e.target.value)
+    setCurrentTime(newTime)
+    
+    // Clear previous debounce
+    if (sliderDebounceRef.current) {
+      clearTimeout(sliderDebounceRef.current)
+    }
+    
+    // Debounce the fetch to avoid too many requests while sliding
+    sliderDebounceRef.current = setTimeout(() => {
+      if (uploadData) {
+        // Clear current selection when time changes
+        setSelectedTarget(null)
+        fetchFrameAndBoxes(uploadData.job_id, newTime)
+      }
+    }, 150)
+  }
+
   // Run analysis with selected target
-  const runAnalysis = async (jobId, targetBox) => {
+  const runAnalysis = async (targetBox, tStart) => {
+    if (!uploadData) return
+    
     setAppState(STATES.ANALYZING)
     setError(null)
 
     try {
-      const formData = new FormData()
-      formData.append('job_id', jobId)
-      if (targetBox) {
-        formData.append('target_box', JSON.stringify(targetBox))
-      }
-
-      const response = await fetch(`${API_BASE}/api/analyze`, {
+      const response = await fetch(`${API_BASE}/api/analyze/${uploadData.job_id}`, {
         method: 'POST',
-        body: formData,
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          target_box: targetBox,
+          t_start: tStart
+        }),
       })
 
       if (!response.ok) {
@@ -138,7 +209,7 @@ function App() {
       setAppState(STATES.RESULTS)
     } catch (err) {
       setError(err.message || 'Failed to analyze video.')
-      setAppState(STATES.UPLOAD)
+      setAppState(STATES.TARGET_SELECT)
     }
   }
 
@@ -149,10 +220,10 @@ function App() {
 
   // Calculate scaled coordinates for drawing boxes on the displayed image
   const getScaledBox = (box) => {
-    if (!uploadData || !imageSize.width) return null
+    if (!frameWidth || !imageSize.width) return null
     
-    const scaleX = imageSize.width / uploadData.frame_width
-    const scaleY = imageSize.height / uploadData.frame_height
+    const scaleX = imageSize.width / frameWidth
+    const scaleY = imageSize.height / frameHeight
     
     return {
       x: box.x * scaleX,
@@ -172,18 +243,19 @@ function App() {
     }
   }, [])
 
-  // Proceed with analysis
-  const handleProceedAnalysis = () => {
-    if (uploadData) {
-      runAnalysis(uploadData.job_id, selectedTarget)
+  // Proceed with analysis using selected target
+  const handleAnalyzeSelected = () => {
+    if (selectedTarget) {
+      runAnalysis(
+        { x: selectedTarget.x, y: selectedTarget.y, w: selectedTarget.w, h: selectedTarget.h },
+        currentTime
+      )
     }
   }
 
-  // Skip target selection (use auto)
+  // Auto-select (null target_box lets backend decide)
   const handleAutoSelect = () => {
-    if (uploadData) {
-      runAnalysis(uploadData.job_id, uploadData.auto_target)
-    }
+    runAnalysis(null, currentTime)
   }
 
   // Download annotated video
@@ -200,7 +272,14 @@ function App() {
     setError(null)
     setUploadData(null)
     setSelectedTarget(null)
+    setAutoTarget(null)
+    setBoxes([])
+    setCurrentTime(0)
     setAppState(STATES.UPLOAD)
+    if (frameUrl) {
+      URL.revokeObjectURL(frameUrl)
+      setFrameUrl(null)
+    }
     if (fileInputRef.current) {
       fileInputRef.current.value = ''
     }
@@ -210,8 +289,21 @@ function App() {
   const formatTime = (seconds) => {
     const mins = Math.floor(seconds / 60)
     const secs = Math.floor(seconds % 60)
-    return `${mins}:${secs.toString().padStart(2, '0')}`
+    const ms = Math.floor((seconds % 1) * 10)
+    return `${mins}:${secs.toString().padStart(2, '0')}.${ms}`
   }
+
+  // Cleanup effect
+  useEffect(() => {
+    return () => {
+      if (frameUrl) {
+        URL.revokeObjectURL(frameUrl)
+      }
+      if (sliderDebounceRef.current) {
+        clearTimeout(sliderDebounceRef.current)
+      }
+    }
+  }, [])
 
   return (
     <div className="app">
@@ -260,7 +352,7 @@ function App() {
                 onClick={handleUpload}
                 disabled={!file}
               >
-                Upload & Detect Persons
+                Upload Video
               </button>
               {file && (
                 <button className="btn btn-secondary" onClick={handleClear}>
@@ -276,66 +368,112 @@ function App() {
           <section className="target-section">
             <h2>Select Your Target</h2>
             <p className="target-instructions">
-              Click on the person you want to analyze. The system detected {uploadData.detections.length} person(s).
+              Use the slider to scrub through the first {maxTime.toFixed(1)} seconds. 
+              Click on the person you want to analyze.
             </p>
             
-            <div className="preview-container">
-              <img 
-                ref={previewImageRef}
-                src={uploadData.preview_image} 
-                alt="First frame preview"
-                className="preview-image"
-                onLoad={handleImageLoad}
-              />
-              
-              {/* Clickable detection boxes overlay */}
-              <div className="detection-overlay">
-                {uploadData.detections.map((det) => {
-                  const scaled = getScaledBox(det)
-                  if (!scaled) return null
-                  
-                  const isSelected = selectedTarget && selectedTarget.id === det.id
-                  const isAuto = uploadData.auto_target && uploadData.auto_target.id === det.id
-                  
-                  return (
-                    <div
-                      key={det.id}
-                      className={`detection-box ${isSelected ? 'selected' : ''} ${isAuto ? 'auto' : ''}`}
-                      style={{
-                        left: `${scaled.x}px`,
-                        top: `${scaled.y}px`,
-                        width: `${scaled.w}px`,
-                        height: `${scaled.h}px`,
-                      }}
-                      onClick={() => handleBoxClick(det)}
-                    >
-                      <span className="detection-label">
-                        #{det.id} {isAuto ? '(auto)' : ''} {det.score ? `${Math.round(det.score * 100)}%` : ''}
-                      </span>
-                    </div>
-                  )
-                })}
+            {/* Timeline Slider */}
+            <div className="timeline-slider-container">
+              <div className="slider-labels">
+                <span>0:00</span>
+                <span className="current-time">{formatTime(currentTime)}</span>
+                <span>{formatTime(maxTime)}</span>
               </div>
+              <input
+                type="range"
+                className="timeline-slider"
+                min="0"
+                max={maxTime}
+                step="0.1"
+                value={currentTime}
+                onChange={handleSliderChange}
+              />
+              <p className="slider-hint">
+                Drag the slider to find a frame where you're clearly visible
+              </p>
             </div>
-
-            <div className="target-info">
-              {selectedTarget ? (
-                <p>Selected: <strong>Person #{selectedTarget.id}</strong></p>
-              ) : (
-                <p>Click on a bounding box to select your target</p>
+            
+            {/* Frame Preview with Boxes */}
+            <div className="preview-container">
+              {loadingFrame && (
+                <div className="frame-loading">
+                  <div className="mini-spinner"></div>
+                </div>
+              )}
+              {frameUrl && (
+                <>
+                  <img 
+                    ref={previewImageRef}
+                    src={frameUrl} 
+                    alt="Video frame preview"
+                    className="preview-image"
+                    onLoad={handleImageLoad}
+                  />
+                  
+                  {/* Clickable detection boxes overlay */}
+                  <div className="detection-overlay">
+                    {boxes.map((det) => {
+                      const scaled = getScaledBox(det)
+                      if (!scaled) return null
+                      
+                      const isSelected = selectedTarget && selectedTarget.id === det.id
+                      const isAuto = autoTarget && autoTarget.id === det.id
+                      
+                      return (
+                        <div
+                          key={det.id}
+                          className={`detection-box ${isSelected ? 'selected' : ''} ${isAuto && !selectedTarget ? 'auto' : ''}`}
+                          style={{
+                            left: `${scaled.x}px`,
+                            top: `${scaled.y}px`,
+                            width: `${scaled.w}px`,
+                            height: `${scaled.h}px`,
+                          }}
+                          onClick={() => handleBoxClick(det)}
+                        >
+                          <span className="detection-label">
+                            #{det.id} {isAuto ? '(suggested)' : ''} {det.score ? `${Math.round(det.score * 100)}%` : ''}
+                          </span>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </>
+              )}
+              
+              {!frameUrl && !loadingFrame && (
+                <div className="no-frame">
+                  <p>Loading frame...</p>
+                </div>
               )}
             </div>
 
+            {/* Selection Info */}
+            <div className="target-info">
+              {boxes.length === 0 ? (
+                <p className="no-detection">No persons detected at this timestamp. Try a different moment.</p>
+              ) : selectedTarget ? (
+                <p>Selected: <strong>Person #{selectedTarget.id}</strong> at {formatTime(currentTime)}</p>
+              ) : (
+                <p>Click on a bounding box to select your target ({boxes.length} person{boxes.length !== 1 ? 's' : ''} detected)</p>
+              )}
+            </div>
+
+            {/* Action Buttons */}
             <div className="button-row">
               <button
                 className="btn btn-primary"
-                onClick={handleProceedAnalysis}
+                onClick={handleAnalyzeSelected}
                 disabled={!selectedTarget}
               >
-                Analyze Selected Target
+                Analyze from {formatTime(currentTime)}
               </button>
-              <button className="btn btn-secondary" onClick={handleAutoSelect}>
-                Use Auto Selection
+              <button 
+                className="btn btn-secondary" 
+                onClick={handleAutoSelect}
+                disabled={boxes.length === 0}
+              >
+                Auto Select & Analyze
               </button>
               <button className="btn btn-secondary" onClick={handleClear}>
                 Cancel
