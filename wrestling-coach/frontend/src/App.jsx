@@ -7,6 +7,7 @@ import TargetSelectStep from './components/TargetSelectStep'
 import AnchorSelectStep from './components/AnchorSelectStep'
 import AnalysisStep from './components/AnalysisStep'
 import ResultsStep from './components/ResultsStep'
+import ErrorBoundary from './components/ErrorBoundary'
 
 // Backend API base URL - change this if deploying elsewhere
 const API_BASE = 'http://localhost:8000'
@@ -349,16 +350,27 @@ function App() {
     setAnalyzeStarted(true)
     setAnalyzeComplete(false)
 
+    const isContinuation = pendingModeRef.current === 'continuation'
+    const clipIndex = session.matchContext.lastClipIndex + 1
+
     try {
+      const requestBody = {
+        anchors: anchors,
+        continuation: isContinuation,
+        clip_index: clipIndex
+      }
+
+      // Add prior context if in continuation mode
+      if (isContinuation) {
+        requestBody.prior_context = buildPriorContext()
+      }
+
       const response = await fetch(`${API_BASE}/api/analyze-with-anchors/${uploadData.job_id}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          anchors: anchors,
-          continuation: false
-        }),
+        body: JSON.stringify(requestBody),
       })
 
       if (!response.ok) {
@@ -367,12 +379,32 @@ function App() {
       }
 
       const data = await response.json()
-      setResults(data)
+      
+      // Build analysis result with metadata
+      const analysisResult = {
+        ...data,
+        clipIndex,
+        timestamp: new Date().toISOString(),
+        isContinuation,
+        duration_analyzed: uploadData.duration_seconds || 0
+      }
+      
+      // Append to session analyses (don't replace!)
+      setSession(prev => ({
+        ...prev,
+        analyses: [...prev.analyses, analysisResult]
+      }))
+      
+      // Update match context
+      updateMatchContext(analysisResult, isContinuation)
+      
       setAnalyzeComplete(true)
       
       // Small delay to show completion state
       setTimeout(() => {
         setAppState(STATES.RESULTS)
+        // Reset mode back to new for next upload
+        pendingModeRef.current = 'new'
       }, 1500)
     } catch (err) {
       setError(err.message || 'Failed to analyze video.')
@@ -496,75 +528,77 @@ function App() {
         onClearChat={handleClearChat}
       />
 
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 sm:py-12">
-        <AnimatePresence mode="wait">
-          {/* Upload Step */}
-          {appState === STATES.UPLOAD && (
-            <UploadStep
-              key="upload"
-              onUpload={handleUpload}
-              isUploading={isUploading}
-              isContinuationMode={pendingModeRef.current === 'continuation'}
-              hasExistingAnalyses={session.analyses.length > 0}
-              onBackToResults={handleBackToResults}
-            />
-          )}
+      <ErrorBoundary onReset={handleClearChat}>
+        <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 sm:py-12">
+          <AnimatePresence mode="wait">
+            {/* Upload Step */}
+            {appState === STATES.UPLOAD && (
+              <UploadStep
+                key="upload"
+                onUpload={handleUpload}
+                isUploading={isUploading}
+                isContinuationMode={pendingModeRef.current === 'continuation'}
+                hasExistingAnalyses={session.analyses.length > 0}
+                onBackToResults={handleBackToResults}
+              />
+            )}
 
-          {/* Anchor Selection Step (New - Robust tracking) */}
-          {appState === STATES.ANCHOR_SELECT && uploadData && (
-            <AnchorSelectStep
-              key="anchor"
-              uploadData={uploadData}
-              onAnalyze={handleAnalyzeWithAnchors}
-              onBack={handleNewAnalysis}
-              apiBase={API_BASE}
-            />
-          )}
+            {/* Anchor Selection Step (New - Robust tracking) */}
+            {appState === STATES.ANCHOR_SELECT && uploadData && (
+              <AnchorSelectStep
+                key="anchor"
+                uploadData={uploadData}
+                onAnalyze={handleAnalyzeWithAnchors}
+                onBack={handleLogoClick}
+                apiBase={API_BASE}
+              />
+            )}
 
-          {/* Target Selection Step (Legacy - single point) */}
-          {appState === STATES.TARGET_SELECT && uploadData && (
-            <TargetSelectStep
-              key="target"
-              uploadData={uploadData}
-              onAnalyze={handleAnalyze}
-              onBack={handleLogoClick}
-              apiBase={API_BASE}
-            />
-          )}
+            {/* Target Selection Step (Legacy - single point) */}
+            {appState === STATES.TARGET_SELECT && uploadData && (
+              <TargetSelectStep
+                key="target"
+                uploadData={uploadData}
+                onAnalyze={handleAnalyze}
+                onBack={handleLogoClick}
+                apiBase={API_BASE}
+              />
+            )}
 
-          {/* Analysis Step */}
-          {appState === STATES.ANALYZING && (
-            <AnalysisStep
-              key="analyzing"
-              uploadComplete={uploadComplete}
-              analyzeStarted={analyzeStarted}
-              analyzeComplete={analyzeComplete}
-              error={error}
-              onRetry={handleRetry}
-            />
-          )}
+            {/* Analysis Step */}
+            {appState === STATES.ANALYZING && (
+              <AnalysisStep
+                key="analyzing"
+                uploadComplete={uploadComplete}
+                analyzeStarted={analyzeStarted}
+                analyzeComplete={analyzeComplete}
+                error={error}
+                onRetry={handleRetry}
+              />
+            )}
 
-          {/* Results Step */}
-          {appState === STATES.RESULTS && session.analyses.length > 0 && (
-            <ResultsStep
-              key="results"
-              session={session}
-              apiBase={API_BASE}
-              onUploadAnother={handleUploadAnother}
-              onUploadContinuation={handleUploadContinuation}
-            />
-          )}
-        </AnimatePresence>
-      </main>
+            {/* Results Step */}
+            {appState === STATES.RESULTS && session.analyses.length > 0 && (
+              <ResultsStep
+                key="results"
+                session={session}
+                apiBase={API_BASE}
+                onUploadAnother={handleUploadAnother}
+                onUploadContinuation={handleUploadContinuation}
+              />
+            )}
+          </AnimatePresence>
+        </main>
 
-      {/* Footer */}
-      <footer className="border-t border-dark-800 py-8 mt-12">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center">
-          <p className="text-dark-500 text-sm">
-            Wrestler AI • Target tracking with CSRT • Pose analysis by MediaPipe • Detection by YOLOv8
-          </p>
-        </div>
-      </footer>
+        {/* Footer */}
+        <footer className="border-t border-dark-800 py-8 mt-12">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center">
+            <p className="text-dark-500 text-sm">
+              Wrestler AI • Target tracking with CSRT • Pose analysis by MediaPipe • Detection by YOLOv8
+            </p>
+          </div>
+        </footer>
+      </ErrorBoundary>
     </div>
   )
 }
