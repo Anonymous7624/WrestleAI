@@ -108,7 +108,7 @@ class TimelineEvent:
 def calculate_angle(a: tuple, b: tuple, c: tuple) -> float:
     """
     Calculate angle at point b given three points (a, b, c).
-    Returns angle in degrees.
+    Returns angle in degrees as native Python float.
     """
     ba = np.array([a[0] - b[0], a[1] - b[1]])
     bc = np.array([c[0] - b[0], c[1] - b[1]])
@@ -117,7 +117,8 @@ def calculate_angle(a: tuple, b: tuple, c: tuple) -> float:
     cosine = np.clip(cosine, -1.0, 1.0)
     angle = np.degrees(np.arccos(cosine))
     
-    return angle
+    # Convert numpy float to native Python float
+    return float(angle)
 
 
 def get_landmark_coords(landmarks, idx: int, min_visibility: float = 0.5) -> Optional[tuple]:
@@ -265,14 +266,14 @@ def compute_aggregate_metrics(frame_metrics: List[FrameMetrics]) -> Dict:
     if not frame_metrics:
         return {}
     
-    # Helper to aggregate a metric
+    # Helper to aggregate a metric - ensures native Python types
     def aggregate(values: List[float]) -> Dict:
         if not values:
             return {"avg": None, "min": None, "max": None, "count": 0}
         return {
-            "avg": round(sum(values) / len(values), 2),
-            "min": round(min(values), 2),
-            "max": round(max(values), 2),
+            "avg": float(round(sum(values) / len(values), 2)),
+            "min": float(round(min(values), 2)),
+            "max": float(round(max(values), 2)),
             "count": len(values)
         }
     
@@ -305,7 +306,8 @@ def compute_aggregate_metrics(frame_metrics: List[FrameMetrics]) -> Dict:
     pct_reaching = (len([w for w in wrist_forward_dists if w > REACHING_THRESHOLD]) / len(wrist_forward_dists) * 100) if wrist_forward_dists else 0
     
     # Calculate lateral motion variance (how much you move side to side)
-    lateral_variance = np.var(ankle_center_xs) if len(ankle_center_xs) > 1 else 0
+    # Convert to float to ensure native Python type
+    lateral_variance = float(np.var(ankle_center_xs)) if len(ankle_center_xs) > 1 else 0.0
     
     return {
         "knee_angle": {
@@ -335,8 +337,8 @@ def compute_aggregate_metrics(frame_metrics: List[FrameMetrics]) -> Dict:
         "head_position": aggregate(head_positions),
         "frames_analyzed": len(frame_metrics),
         "motion_stability": {
-            "knee_variance": round(np.var(knee_angles), 2) if len(knee_angles) > 1 else 0,
-            "stance_variance": round(np.var(stance_widths), 4) if len(stance_widths) > 1 else 0
+            "knee_variance": round(float(np.var(knee_angles)), 2) if len(knee_angles) > 1 else 0.0,
+            "stance_variance": round(float(np.var(stance_widths)), 4) if len(stance_widths) > 1 else 0.0
         },
         # Extended metrics
         "torso_angle": {
@@ -354,8 +356,8 @@ def compute_aggregate_metrics(frame_metrics: List[FrameMetrics]) -> Dict:
             "pct_reaching": round(pct_reaching, 1)
         },
         "lateral_motion": {
-            "variance": round(lateral_variance, 6),
-            "is_low": lateral_variance < LATERAL_MOTION_LOW_THRESHOLD
+            "variance": round(float(lateral_variance), 6),
+            "is_low": bool(lateral_variance < LATERAL_MOTION_LOW_THRESHOLD)
         },
         "trail_leg": aggregate(rear_knee_angles),
         "lead_leg": aggregate(lead_knee_angles)
@@ -395,10 +397,10 @@ def detect_timeline_events(
                     end_time = current_run[-1][0]
                     avg_value = sum(v for _, v in current_run) / len(current_run)
                     runs.append({
-                        "timestamp": round(start_time, 2),
-                        "duration": round(end_time - start_time, 2),
+                        "timestamp": float(round(start_time, 2)),
+                        "duration": float(round(end_time - start_time, 2)),
                         "metric": metric_name,
-                        "value": round(avg_value, 2),
+                        "value": float(round(avg_value, 2)),
                         "message": message_template.format(value=round(avg_value, 1))
                     })
                 current_run = []
@@ -409,10 +411,10 @@ def detect_timeline_events(
             end_time = current_run[-1][0]
             avg_value = sum(v for _, v in current_run) / len(current_run)
             runs.append({
-                "timestamp": round(start_time, 2),
-                "duration": round(end_time - start_time, 2),
+                "timestamp": float(round(start_time, 2)),
+                "duration": float(round(end_time - start_time, 2)),
                 "metric": metric_name,
-                "value": round(avg_value, 2),
+                "value": float(round(avg_value, 2)),
                 "message": message_template.format(value=round(avg_value, 1))
             })
         
@@ -516,10 +518,10 @@ def detect_wrestling_events(
             
             events.append({
                 "type": "LEVEL_CHANGE",
-                "t_start": round(t_start, 2),
-                "t_end": round(t_end, 2),
-                "confidence": round(confidence, 2),
-                "description": f"Level change detected - hip dropped rapidly with knee bend increase"
+                "t_start": float(round(t_start, 2)),
+                "t_end": float(round(t_end, 2)),
+                "confidence": float(round(confidence, 2)),
+                "description": "Level change detected - hip dropped rapidly with knee bend increase"
             })
             
             # Mark frames as used
@@ -568,10 +570,10 @@ def detect_wrestling_events(
             
             events.append({
                 "type": "SHOT_ATTEMPT",
-                "t_start": round(t_start, 2),
-                "t_end": round(t_end, 2),
-                "confidence": round(confidence, 2),
-                "description": f"Shot attempt detected - level change with forward penetration"
+                "t_start": float(round(t_start, 2)),
+                "t_end": float(round(t_end, 2)),
+                "confidence": float(round(confidence, 2)),
+                "description": "Shot attempt detected - level change with forward penetration"
             })
             
             for j in range(start_idx, end_idx + 1):
@@ -618,10 +620,10 @@ def detect_wrestling_events(
             
             events.append({
                 "type": "SPRAWL_DEFENSE",
-                "t_start": round(t_start, 2),
-                "t_end": round(t_end, 2),
-                "confidence": round(confidence, 2),
-                "description": f"Sprawl defense detected - hip drop with leg extension"
+                "t_start": float(round(t_start, 2)),
+                "t_end": float(round(t_end, 2)),
+                "confidence": float(round(confidence, 2)),
+                "description": "Sprawl defense detected - hip drop with leg extension"
             })
             
             for j in range(start_idx, end_idx + 1):
