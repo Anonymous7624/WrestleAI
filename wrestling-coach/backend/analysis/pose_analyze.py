@@ -937,7 +937,10 @@ def generate_coach_speech(
     metrics: Dict, 
     pointers: List[Dict], 
     wrestling_events: List[Dict],
-    duration_analyzed: float
+    duration_analyzed: float,
+    continuation: bool = False,
+    clip_index: Optional[int] = None,
+    prior_context: Optional[Dict] = None
 ) -> str:
     """
     Generate a coach's speech summary (minimum 8 sentences).
@@ -947,8 +950,18 @@ def generate_coach_speech(
     - At least 1-2 detected events with timestamps (or notes absence)
     
     Does NOT claim takedowns/points unless explicitly detected.
+    
+    Args:
+        metrics: Aggregated metrics from the analysis
+        pointers: List of coaching tips
+        wrestling_events: Detected wrestling events
+        duration_analyzed: Duration in seconds
+        continuation: Whether this is a continuation clip
+        clip_index: Index of this clip (1-based)
+        prior_context: Context from previous analysis for continuity references
     """
     speech_parts = []
+    prior_context = prior_context or {}
     
     # Get key metrics for reference
     knee_avg = metrics.get("knee_angle", {}).get("avg")
@@ -966,26 +979,53 @@ def generate_coach_speech(
     # Collect top tip titles (first 5)
     top_tips = [p["title"] for p in pointers[:5]] if pointers else []
     
-    # Opening sentence
+    # Check for recurring issues from prior context
+    recurring_issues = prior_context.get("recurringIssues", {})
+    prior_tips = [t.get("title", "") for t in prior_context.get("lastTips", [])]
+    
+    # Opening sentence with continuation context
+    if continuation and clip_index:
+        speech_parts.append(
+            f"Alright, this is clip {clip_index} in our session - let's see how you're progressing."
+        )
+        if prior_tips:
+            speech_parts.append(
+                f"Earlier we identified issues with {prior_tips[0] if prior_tips else 'your positioning'} - let's see if that's improved."
+            )
+    
     if pointers and len(pointers) >= 3:
         speech_parts.append(
-            f"Overall, I analyzed {frames_analyzed} frames (about {duration_analyzed:.1f} seconds) of your wrestling, and there are some clear areas to work on."
+            f"In this {duration_analyzed:.1f}-second clip ({frames_analyzed} frames), there are some clear areas to address."
         )
     else:
         speech_parts.append(
             f"I reviewed {frames_analyzed} frames of your footage, and your fundamentals look solid with just a few adjustments needed."
         )
     
-    # Reference top tips (at least 3)
+    # Reference top tips (at least 3), noting if they're recurring from prior clips
     if len(top_tips) >= 1:
-        speech_parts.append(
-            f"Your biggest focus area should be '{top_tips[0]}' - this came up repeatedly throughout the clip."
-        )
+        tip_1 = top_tips[0]
+        is_recurring = recurring_issues.get(tip_1.lower(), 0) >= 1
+        if is_recurring and continuation:
+            speech_parts.append(
+                f"I'm seeing '{tip_1}' come up again - this was an issue in your earlier clip too. Let's really focus on drilling this."
+            )
+        else:
+            speech_parts.append(
+                f"Your biggest focus area should be '{tip_1}' - this came up repeatedly throughout the clip."
+            )
     
     if len(top_tips) >= 2:
-        speech_parts.append(
-            f"I also noticed issues with '{top_tips[1]}' that are limiting your effectiveness and making you vulnerable."
-        )
+        tip_2 = top_tips[1]
+        is_recurring = recurring_issues.get(tip_2.lower(), 0) >= 1
+        if is_recurring and continuation:
+            speech_parts.append(
+                f"'{tip_2}' is still showing up - you're making progress but need more reps on this fundamental."
+            )
+        else:
+            speech_parts.append(
+                f"I also noticed issues with '{tip_2}' that are limiting your effectiveness and making you vulnerable."
+            )
     
     if len(top_tips) >= 3:
         speech_parts.append(
@@ -1124,7 +1164,10 @@ def analyze_video(
     input_path: str,
     output_path: str,
     target_box: Optional[Dict] = None,
-    t_start: float = 0.0
+    t_start: float = 0.0,
+    continuation: bool = False,
+    clip_index: Optional[int] = None,
+    prior_context: Optional[Dict] = None
 ) -> dict:
     """
     Main analysis function with target tracking.
@@ -1134,6 +1177,9 @@ def analyze_video(
         output_path: Path to write annotated output video
         target_box: Optional pre-selected target bounding box (x, y, w, h)
         t_start: Start timestamp in seconds (default 0.0)
+        continuation: Whether this is a continuation of a previous analysis
+        clip_index: Index of this clip in the session (1-based)
+        prior_context: Context from previous analysis for continuation mode
         
     Returns:
         Dict with pointers, metrics, timeline, and analysis stats
@@ -1302,20 +1348,66 @@ def analyze_video(
     # Calculate duration analyzed
     duration_analyzed = frame_count / fps if fps > 0 else 0
     
-    # Generate coach's speech
+    # Generate coach's speech with continuation context
     coach_speech = generate_coach_speech(
         aggregate_metrics, 
         pointers, 
         wrestling_events,
-        duration_analyzed
+        duration_analyzed,
+        continuation=continuation,
+        clip_index=clip_index,
+        prior_context=prior_context
     )
+    
+    # Build match context output for continuation tracking
+    match_context_out = None
+    if continuation or clip_index:
+        # Calculate accumulated totals
+        total_shots = len([e for e in wrestling_events if e["type"] == "SHOT_ATTEMPT"])
+        total_level_changes = len([e for e in wrestling_events if e["type"] == "LEVEL_CHANGE"])
+        total_sprawls = len([e for e in wrestling_events if e["type"] == "SPRAWL_DEFENSE"])
+        
+        # Add to prior totals if available
+        if prior_context:
+            total_shots += prior_context.get("totalShotAttempts", 0)
+            total_level_changes += prior_context.get("totalLevelChanges", 0)
+            total_sprawls += prior_context.get("totalSprawls", 0)
+        
+        # Track recurring issues
+        recurring = prior_context.get("recurringIssues", {}) if prior_context else {}
+        for p in pointers:
+            title = p.get("title", "").lower()
+            if title:
+                recurring[title] = recurring.get(title, 0) + 1
+        
+        # Build narrative summary
+        clip_num = clip_index or 1
+        narrative_lines = [
+            f"Session: {clip_num} clip{'s' if clip_num > 1 else ''} analyzed.",
+            f"Total events: {total_shots} shots, {total_level_changes} level changes, {total_sprawls} sprawls.",
+        ]
+        
+        # Note recurring issues
+        high_frequency = [k for k, v in recurring.items() if v >= 2]
+        if high_frequency:
+            narrative_lines.append(f"Recurring issues: {', '.join(high_frequency[:3])}.")
+        
+        match_context_out = {
+            "totalShotAttempts": total_shots,
+            "totalLevelChanges": total_level_changes,
+            "totalSprawls": total_sprawls,
+            "recurringIssues": recurring,
+            "clipCount": clip_num,
+            "narrative": " ".join(narrative_lines)
+        }
     
     return {
         "pointers": pointers,
         "metrics": aggregate_metrics,
         "timeline": timeline,
         "events": wrestling_events,
-        "coach_speech": coach_speech
+        "coach_speech": coach_speech,
+        "match_context_out": match_context_out
     }
 
 

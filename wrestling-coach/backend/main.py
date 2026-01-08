@@ -135,9 +135,29 @@ class TargetBox(BaseModel):
     h: int
 
 
+class PriorContext(BaseModel):
+    """
+    Prior context from previous analysis for continuation mode.
+    All fields optional to maintain backward compatibility.
+    """
+    lastTips: Optional[list] = None  # [{title, evidence}, ...]
+    lastEvents: Optional[list] = None  # [{type, timestamp}, ...]
+    lastMetrics: Optional[dict] = None  # {knee_angle_avg, stance_width_avg}
+    coachSpeechSummary: Optional[str] = None
+    totalShotAttempts: Optional[int] = None
+    totalLevelChanges: Optional[int] = None
+    totalSprawls: Optional[int] = None
+    recurringIssues: Optional[dict] = None  # {issue_title: count}
+    clipNumber: Optional[int] = None
+
+
 class AnalyzeRequest(BaseModel):
     target_box: Optional[TargetBox] = None
     t_start: float = 0.0
+    # Continuation mode fields (optional for backward compatibility)
+    continuation: Optional[bool] = False
+    clip_index: Optional[int] = None
+    prior_context: Optional[PriorContext] = None
 
 
 @app.get("/")
@@ -427,13 +447,31 @@ async def analyze(job_id: str, request: AnalyzeRequest):
     # Clamp t_start to valid range
     t_start = max(0, min(request.t_start, metadata["duration_seconds"]))
     
+    # Parse prior_context if provided
+    parsed_prior_context = None
+    if request.prior_context:
+        parsed_prior_context = {
+            "lastTips": request.prior_context.lastTips,
+            "lastEvents": request.prior_context.lastEvents,
+            "lastMetrics": request.prior_context.lastMetrics,
+            "coachSpeechSummary": request.prior_context.coachSpeechSummary,
+            "totalShotAttempts": request.prior_context.totalShotAttempts or 0,
+            "totalLevelChanges": request.prior_context.totalLevelChanges or 0,
+            "totalSprawls": request.prior_context.totalSprawls or 0,
+            "recurringIssues": request.prior_context.recurringIssues or {},
+            "clipNumber": request.prior_context.clipNumber or 1
+        }
+    
     # Run pose analysis with target tracking
     try:
         result = analyze_video(
             str(input_path), 
             str(output_path), 
             target_box=parsed_target,
-            t_start=t_start
+            t_start=t_start,
+            continuation=request.continuation or False,
+            clip_index=request.clip_index,
+            prior_context=parsed_prior_context
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -448,7 +486,8 @@ async def analyze(job_id: str, request: AnalyzeRequest):
         "timeline": result.get("timeline", []),
         "events": result.get("events", []),
         "coach_speech": result.get("coach_speech", ""),
-        "annotated_video_url": f"/api/output/{job_id}"
+        "annotated_video_url": f"/api/output/{job_id}",
+        "match_context_out": result.get("match_context_out")  # For continuation tracking
     }
     
     # Convert all numpy types to native Python types for JSON serialization
