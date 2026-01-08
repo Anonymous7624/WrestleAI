@@ -26,10 +26,11 @@ venv/
 ENV/
 env/
 
-# Backend uploads, outputs, previews, and ML models (video/image files and binary weights)
+# Backend uploads, outputs, previews, frame cache, and ML models (video/image files and binary weights)
 backend/uploads/
 backend/outputs/
 backend/previews/
+backend/frame_cache/
 backend/models/
 
 # IDE
