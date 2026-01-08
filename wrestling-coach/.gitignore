@@ -31,6 +31,7 @@ backend/uploads/
 backend/outputs/
 backend/previews/
 backend/frame_cache/
+backend/cache/
 backend/models/
 
 # IDE
