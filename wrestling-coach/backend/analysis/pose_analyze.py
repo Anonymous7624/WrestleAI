@@ -5,7 +5,7 @@ Now with target tracking, cropped pose analysis, and wrestling event detection.
 """
 
 import math
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Set
 from dataclasses import dataclass, field
 import cv2
 import mediapipe as mp
@@ -52,6 +52,12 @@ LEVEL_CHANGE_KNEE_BEND_INCREASE = 15  # Degrees of additional knee bend
 SHOT_FORWARD_VELOCITY_THRESHOLD = 0.03  # Normalized forward movement per frame
 SPRAWL_HIP_DROP_THRESHOLD = 0.03  # Hip drop for sprawl
 SPRAWL_LEG_EXTENSION_THRESHOLD = 0.05  # Leg extension backwards
+
+# Inactive frame detection thresholds (standing/not wrestling)
+INACTIVE_KNEE_ANGLE_THRESHOLD = 165  # Very straight legs = standing
+INACTIVE_HIP_SHOULDER_RATIO = 0.25   # Hip very close to shoulder height = upright
+INACTIVE_TORSO_ANGLE_MAX = 15        # Very upright torso = standing
+INACTIVE_MIN_CONSECUTIVE_FRAMES = 5  # Need consecutive frames to mark inactive
 
 # Additional tip thresholds
 TORSO_ANGLE_TOO_BENT = 35  # Degrees - torso bent too far forward at waist
@@ -569,6 +575,108 @@ def detect_timeline_events(
     events.sort(key=lambda e: e["timestamp"])
     
     return events
+
+
+def detect_inactive_frames(
+    frame_metrics: List[FrameMetrics],
+    fps: float
+) -> Tuple[List[int], float, float]:
+    """
+    Detect frames where the wrestler is "inactive" (standing upright, not wrestling).
+    
+    A frame is considered inactive if:
+    - Knee angles are very high (>165 degrees = nearly straight legs)
+    - Hip height is close to shoulder height (upright posture)
+    - Minimal forward lean
+    
+    Must be sustained for multiple consecutive frames to count as inactive.
+    
+    Args:
+        frame_metrics: List of per-frame metrics
+        fps: Video frames per second
+        
+    Returns:
+        Tuple of:
+        - List of inactive frame indices
+        - Percentage of inactive frames
+        - Percentage of active frames
+    """
+    if not frame_metrics:
+        return [], 0.0, 100.0
+    
+    inactive_indices = []
+    min_consecutive = max(3, int(fps * 0.3))  # At least 0.3 seconds
+    
+    # First pass: mark potentially inactive frames
+    potential_inactive = []
+    for i, m in enumerate(frame_metrics):
+        is_inactive = False
+        
+        # Check knee angle (very straight = standing)
+        knee_check = False
+        if m.knee_angle_avg is not None and m.knee_angle_avg > INACTIVE_KNEE_ANGLE_THRESHOLD:
+            knee_check = True
+        
+        # Check hip-shoulder ratio (upright posture)
+        posture_check = False
+        if m.hip_height_ratio is not None and m.hip_height_ratio < INACTIVE_HIP_SHOULDER_RATIO:
+            posture_check = True
+        
+        # Check torso angle (minimal forward lean)
+        lean_check = False
+        if m.torso_angle is not None and m.torso_angle < INACTIVE_TORSO_ANGLE_MAX:
+            lean_check = True
+        
+        # Need at least 2 of 3 conditions to be potentially inactive
+        conditions_met = sum([knee_check, posture_check, lean_check])
+        if conditions_met >= 2:
+            potential_inactive.append(i)
+    
+    # Second pass: only mark as inactive if part of consecutive run
+    if len(potential_inactive) > 0:
+        current_run = [potential_inactive[0]]
+        
+        for i in range(1, len(potential_inactive)):
+            if potential_inactive[i] == potential_inactive[i-1] + 1:
+                # Consecutive frame
+                current_run.append(potential_inactive[i])
+            else:
+                # Run ended - check if long enough
+                if len(current_run) >= min_consecutive:
+                    inactive_indices.extend(current_run)
+                current_run = [potential_inactive[i]]
+        
+        # Check final run
+        if len(current_run) >= min_consecutive:
+            inactive_indices.extend(current_run)
+    
+    # Calculate percentages
+    total_frames = len(frame_metrics)
+    inactive_count = len(inactive_indices)
+    active_count = total_frames - inactive_count
+    
+    percent_inactive = (inactive_count / total_frames * 100) if total_frames > 0 else 0.0
+    percent_active = (active_count / total_frames * 100) if total_frames > 0 else 100.0
+    
+    return inactive_indices, percent_inactive, percent_active
+
+
+def filter_metrics_for_analysis(
+    frame_metrics: List[FrameMetrics],
+    inactive_indices: List[int]
+) -> List[FrameMetrics]:
+    """
+    Filter out inactive frames from metrics for analysis.
+    
+    Args:
+        frame_metrics: Full list of frame metrics
+        inactive_indices: Indices of inactive frames to exclude
+        
+    Returns:
+        Filtered list of frame metrics (active frames only)
+    """
+    inactive_set = set(inactive_indices)
+    return [m for i, m in enumerate(frame_metrics) if i not in inactive_set]
 
 
 def detect_wrestling_events(
@@ -1579,7 +1687,10 @@ def extract_first_frame(video_path: str) -> Tuple[np.ndarray, int, int]:
 def analyze_video_with_anchors(
     input_path: str,
     output_path: str,
-    anchors: List[Dict]
+    anchors: List[Dict],
+    skill_level: str = "intermediate",
+    trim_start: float = 0.0,
+    trim_end: float = None
 ) -> dict:
     """
     Main analysis function with anchor-based tracking.
@@ -1933,16 +2044,39 @@ def analyze_video_with_anchors(
     if not frame_metrics_list:
         raise ValueError("No pose landmarks detected in video. Ensure a person is visible.")
     
-    # Compute aggregate metrics
-    aggregate_metrics = compute_aggregate_metrics(frame_metrics_list)
+    # Detect inactive frames (standing/not wrestling)
+    inactive_indices, percent_inactive, percent_active = detect_inactive_frames(
+        frame_metrics_list, fps
+    )
     
-    # Detect timeline events
-    timeline = detect_timeline_events(frame_metrics_list, fps)
+    # Filter out inactive frames for metric computation
+    active_frame_metrics = filter_metrics_for_analysis(frame_metrics_list, inactive_indices)
     
-    # Detect wrestling-specific events
-    wrestling_events = detect_wrestling_events(frame_metrics_list, fps)
+    # If all frames are inactive, use all frames to avoid empty analysis
+    if not active_frame_metrics:
+        active_frame_metrics = frame_metrics_list
+        percent_inactive = 0.0
+        percent_active = 100.0
     
-    # Generate rich pointers
+    # Compute aggregate metrics on ACTIVE frames only
+    aggregate_metrics = compute_aggregate_metrics(active_frame_metrics)
+    
+    # Add inactive frame stats to metrics
+    aggregate_metrics["activity"] = {
+        "percent_active": round(percent_active, 1),
+        "percent_inactive": round(percent_inactive, 1),
+        "active_frames": len(active_frame_metrics),
+        "total_frames": len(frame_metrics_list),
+        "inactive_frames": len(inactive_indices)
+    }
+    
+    # Detect timeline events on ACTIVE frames only
+    timeline = detect_timeline_events(active_frame_metrics, fps)
+    
+    # Detect wrestling-specific events on ACTIVE frames only
+    wrestling_events = detect_wrestling_events(active_frame_metrics, fps)
+    
+    # Generate rich pointers based on active frames
     pointers = generate_rich_pointers(aggregate_metrics, timeline, wrestling_events)
     
     # Calculate duration analyzed
@@ -1973,5 +2107,8 @@ def analyze_video_with_anchors(
         "timeline": timeline,
         "events": wrestling_events,
         "coach_speech": coach_speech,
-        "tracking_diagnostics": tracking_diagnostics
+        "tracking_diagnostics": tracking_diagnostics,
+        "percent_inactive_frames": percent_inactive,
+        "percent_active_frames": percent_active,
+        "skill_level": skill_level
     }

@@ -3,6 +3,7 @@ import { AnimatePresence } from 'framer-motion'
 
 import Header from './components/Header'
 import UploadStep from './components/UploadStep'
+import TrimStep from './components/TrimStep'
 import TargetSelectStep from './components/TargetSelectStep'
 import AnchorSelectStep from './components/AnchorSelectStep'
 import AnalysisStep from './components/AnalysisStep'
@@ -17,13 +18,15 @@ const STORAGE_KEYS = {
   SESSION: 'wrestlerAI-session',
   UPLOAD_DATA: 'wrestlerAI-uploadData',
   LAST_TARGET: 'wrestlerAI-lastTarget',
+  SKILL_LEVEL: 'wrestlerAI-skillLevel',
 }
 
 // Application states
 const STATES = {
   UPLOAD: 'upload',
+  TRIM: 'trim',  // New trim step
   TARGET_SELECT: 'target_select',
-  ANCHOR_SELECT: 'anchor_select',  // New anchor-based selection
+  ANCHOR_SELECT: 'anchor_select',
   ANALYZING: 'analyzing',
   RESULTS: 'results'
 }
@@ -129,6 +132,14 @@ function App() {
     return null
   })
 
+  // Skill level for analysis
+  const [skillLevel, setSkillLevel] = useState(() => {
+    return localStorage.getItem(STORAGE_KEYS.SKILL_LEVEL) || 'intermediate'
+  })
+
+  // Trim data
+  const [trimData, setTrimData] = useState(null)
+
   // Mode for current/pending upload
   const pendingModeRef = useRef('new')
 
@@ -150,6 +161,11 @@ function App() {
       localStorage.setItem(STORAGE_KEYS.LAST_TARGET, JSON.stringify(lastTarget))
     }
   }, [lastTarget])
+
+  // Persist skill level
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEYS.SKILL_LEVEL, skillLevel)
+  }, [skillLevel])
 
   // Build prior context from last analysis for continuation mode
   const buildPriorContext = useCallback(() => {
@@ -255,12 +271,20 @@ function App() {
       setUploadData(data)
       setUploadComplete(true)
       setIsUploading(false)
-      // Use anchor selection for better tracking
-      setAppState(STATES.ANCHOR_SELECT)
+      setTrimData(null)  // Reset trim data for new upload
+      // Go to trim step first
+      setAppState(STATES.TRIM)
     } catch (err) {
       setError(err.message || 'Failed to upload video. Is the backend running?')
       setIsUploading(false)
     }
+  }
+
+  // Handle trim completion
+  const handleTrimComplete = (trimResult) => {
+    setTrimData(trimResult)
+    // Proceed to anchor selection
+    setAppState(STATES.ANCHOR_SELECT)
   }
 
   // Run analysis with selected target (legacy single-point tracking)
@@ -357,7 +381,8 @@ function App() {
       const requestBody = {
         anchors: anchors,
         continuation: isContinuation,
-        clip_index: clipIndex
+        clip_index: clipIndex,
+        skill_level: skillLevel
       }
 
       // Add prior context if in continuation mode
@@ -434,10 +459,17 @@ function App() {
     setError(null)
   }
 
+  // Go back to trim from anchor selection
+  const handleBackToTrim = () => {
+    setAppState(STATES.TRIM)
+    setError(null)
+  }
+
   // Clear chat - wipe everything and start fresh
   const handleClearChat = () => {
     setAppState(STATES.UPLOAD)
     setUploadData(null)
+    setTrimData(null)
     setError(null)
     setIsUploading(false)
     setUploadComplete(false)
@@ -470,6 +502,7 @@ function App() {
   const handleLogoClick = () => {
     setAppState(STATES.UPLOAD)
     setUploadData(null)
+    setTrimData(null)
     setError(null)
     setIsUploading(false)
     setUploadComplete(false)
@@ -487,6 +520,7 @@ function App() {
     pendingModeRef.current = 'new'
     setAppState(STATES.UPLOAD)
     setUploadData(null)
+    setTrimData(null)
     setError(null)
     setIsUploading(false)
     setUploadComplete(false)
@@ -503,6 +537,7 @@ function App() {
     pendingModeRef.current = 'continuation'
     setAppState(STATES.UPLOAD)
     setUploadData(null)
+    setTrimData(null)
     setError(null)
     setIsUploading(false)
     setUploadComplete(false)
@@ -512,6 +547,45 @@ function App() {
     
     localStorage.removeItem(STORAGE_KEYS.UPLOAD_DATA)
     localStorage.removeItem(STORAGE_KEYS.LAST_TARGET)
+  }
+
+  // Inline upload from Results page (stays on results, adds new analysis)
+  const handleInlineUpload = async (file, isContinuation) => {
+    // Set the mode
+    pendingModeRef.current = isContinuation ? 'continuation' : 'new'
+    
+    // Start upload process
+    setIsUploading(true)
+    setError(null)
+    setUploadComplete(false)
+    setAnalyzeStarted(false)
+    setAnalyzeComplete(false)
+
+    try {
+      const formData = new FormData()
+      formData.append('file', file)
+
+      const response = await fetch(`${API_BASE}/api/upload`, {
+        method: 'POST',
+        body: formData,
+      })
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}))
+        throw new Error(errorData.detail || `Upload failed (${response.status})`)
+      }
+
+      const data = await response.json()
+      setUploadData(data)
+      setUploadComplete(true)
+      setIsUploading(false)
+      setTrimData(null)
+      // Go to trim step
+      setAppState(STATES.TRIM)
+    } catch (err) {
+      setError(err.message || 'Failed to upload video. Is the backend running?')
+      setIsUploading(false)
+    }
   }
 
   // Go back to results (if we have any)
@@ -543,14 +617,27 @@ function App() {
               />
             )}
 
+            {/* Trim Step - After upload, before anchors */}
+            {appState === STATES.TRIM && uploadData && (
+              <TrimStep
+                key="trim"
+                uploadData={uploadData}
+                onTrimComplete={handleTrimComplete}
+                onBack={handleLogoClick}
+                apiBase={API_BASE}
+              />
+            )}
+
             {/* Anchor Selection Step (New - Robust tracking) */}
             {appState === STATES.ANCHOR_SELECT && uploadData && (
               <AnchorSelectStep
                 key="anchor"
                 uploadData={uploadData}
                 onAnalyze={handleAnalyzeWithAnchors}
-                onBack={handleLogoClick}
+                onBack={handleBackToTrim}
                 apiBase={API_BASE}
+                skillLevel={skillLevel}
+                onSkillLevelChange={setSkillLevel}
               />
             )}
 
@@ -585,6 +672,8 @@ function App() {
                 apiBase={API_BASE}
                 onUploadAnother={handleUploadAnother}
                 onUploadContinuation={handleUploadContinuation}
+                onInlineUpload={handleInlineUpload}
+                isUploading={isUploading}
               />
             )}
           </AnimatePresence>
