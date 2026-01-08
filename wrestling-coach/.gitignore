@@ -26,10 +26,11 @@ venv/
 ENV/
 env/
 
-# Backend uploads, outputs, and previews (video/image files)
+# Backend uploads, outputs, previews, and ML models (video/image files and binary weights)
 backend/uploads/
 backend/outputs/
 backend/previews/
+backend/models/
 
 # IDE
 .vscode/
