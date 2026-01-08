@@ -1,6 +1,14 @@
+# Core framework
 fastapi==0.109.0
 uvicorn==0.27.0
 python-multipart==0.0.6
+
+# PyTorch - pinned to 2.5.x to avoid weights_only=True default in 2.6+
+# This prevents "DetectionModel was not an allowed global" errors with ultralytics
+torch==2.5.1
+torchvision==0.20.1
+
+# Computer Vision & ML
 opencv-python==4.9.0.80
 opencv-contrib-python==4.9.0.80
 mediapipe==0.10.9

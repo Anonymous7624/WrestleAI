@@ -568,7 +568,8 @@ def draw_target_box(frame: np.ndarray, box: Dict, tracking_ok: bool = True):
 def analyze_video(
     input_path: str,
     output_path: str,
-    target_box: Optional[Dict] = None
+    target_box: Optional[Dict] = None,
+    t_start: float = 0.0
 ) -> dict:
     """
     Main analysis function with target tracking.
@@ -577,6 +578,7 @@ def analyze_video(
         input_path: Path to input video file
         output_path: Path to write annotated output video
         target_box: Optional pre-selected target bounding box (x, y, w, h)
+        t_start: Start timestamp in seconds (default 0.0)
         
     Returns:
         Dict with pointers, metrics, timeline, and analysis stats
@@ -595,13 +597,19 @@ def analyze_video(
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = total_frames / fps if fps > 0 else 0
     
     if width == 0 or height == 0:
         cap.release()
         raise ValueError("Invalid video dimensions")
     
-    # Calculate max frames based on MAX_SECONDS
-    max_frames = int(fps * MAX_SECONDS)
+    # Clamp t_start to valid range
+    t_start = max(0, min(t_start, duration))
+    
+    # Calculate frame range for analysis
+    start_frame = int(t_start * fps)
+    max_end_time = min(t_start + MAX_SECONDS, duration)
+    max_frames_to_process = int((max_end_time - t_start) * fps)
     
     # Setup video writer
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -611,23 +619,26 @@ def analyze_video(
         cap.release()
         raise ValueError("Could not create output video writer")
     
+    # Seek to start frame
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    
     # Read first frame for target selection
     ret, first_frame = cap.read()
     if not ret:
         cap.release()
         out.release()
-        raise ValueError("Could not read first frame")
+        raise ValueError(f"Could not read frame at t={t_start}s")
     
     # Initialize target tracker
     if target_box is None:
-        # Auto-select target
+        # Auto-select target on the frame at t_start
         detections = detect_persons(first_frame)
         target_box = auto_select_target(detections, width, height)
         
         if target_box is None:
             cap.release()
             out.release()
-            raise ValueError("No person detected in video. Ensure a person is visible.")
+            raise ValueError("No person detected in video at the specified start time. Ensure a person is visible.")
     
     # Validate target box
     target_box["x"] = max(0, min(target_box["x"], width - 10))
@@ -640,8 +651,8 @@ def analyze_video(
     # Aggregation for metrics
     frame_metrics_list: List[FrameMetrics] = []
     
-    # Reset video to beginning
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    # Reset to start position for processing
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     
     # Process frames with MediaPipe Pose
     with mp_pose.Pose(
@@ -653,12 +664,13 @@ def analyze_video(
     ) as pose:
         
         frame_count = 0
-        while cap.isOpened() and frame_count < max_frames:
+        while cap.isOpened() and frame_count < max_frames_to_process:
             ret, frame = cap.read()
             if not ret:
                 break
             
-            timestamp = frame_count / fps
+            # Calculate timestamp relative to video start (not t_start)
+            timestamp = t_start + (frame_count / fps)
             frame_count += 1
             
             # Update tracker
