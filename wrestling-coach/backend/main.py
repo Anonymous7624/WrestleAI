@@ -371,6 +371,8 @@ async def analyze(job_id: str, request: AnalyzeRequest):
         "pointers": result["pointers"],
         "metrics": result["metrics"],
         "timeline": result.get("timeline", []),
+        "events": result.get("events", []),
+        "coach_speech": result.get("coach_speech", ""),
         "annotated_video_url": f"/api/output/{job_id}"
     }
 

@@ -504,6 +504,16 @@ function App() {
           <section className="results-section">
             <h2>Analysis Results</h2>
 
+            {/* Coach's Speech - NEW SECTION */}
+            {results.coach_speech && (
+              <div className="coach-speech-card">
+                <h3>🎙️ Coach's Speech</h3>
+                <div className="coach-speech-content">
+                  <p>{results.coach_speech}</p>
+                </div>
+              </div>
+            )}
+
             {/* Top Notes / Pointers */}
             <div className="pointers-card">
               <h3>📋 Top Coaching Notes ({results.pointers.length})</h3>
@@ -526,6 +536,27 @@ function App() {
                 ))}
               </ul>
             </div>
+
+            {/* Wrestling Events Section */}
+            {results.events && results.events.length > 0 && (
+              <div className="events-card">
+                <h3>🤼 Detected Wrestling Events</h3>
+                <div className="events-list">
+                  {results.events.map((event, idx) => (
+                    <div key={idx} className={`event-item event-${event.type.toLowerCase()}`}>
+                      <div className="event-header">
+                        <span className="event-type">{event.type.replace(/_/g, ' ')}</span>
+                        <span className="event-confidence">{Math.round(event.confidence * 100)}% confidence</span>
+                      </div>
+                      <div className="event-time">
+                        {formatTime(event.t_start)} - {formatTime(event.t_end)}
+                      </div>
+                      <div className="event-description">{event.description}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {/* Timeline Events */}
             {results.timeline && results.timeline.length > 0 && (
