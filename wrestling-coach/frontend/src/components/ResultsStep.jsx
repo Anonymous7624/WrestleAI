@@ -15,12 +15,15 @@ import {
   Layers,
   Target,
   Repeat,
-  AlertTriangle
+  AlertTriangle,
+  Star,
+  Activity
 } from 'lucide-react'
 import clsx from 'clsx'
 import SectionNav from './SectionNav'
 import TipCard from './TipCard'
 import MetricGrid from './MetricGrid'
+import InlineUploader from './InlineUploader'
 
 // Format time from seconds to MM:SS
 function formatTime(seconds) {
@@ -196,6 +199,61 @@ function buildSessionSummaryText(session) {
   return lines.join('\n')
 }
 
+// Rating display component
+function RatingDisplay({ rating, explanation }) {
+  const getRatingColor = (r) => {
+    if (r >= 8) return 'text-green-400 bg-green-500/20 border-green-500/30'
+    if (r >= 6) return 'text-amber-400 bg-amber-500/20 border-amber-500/30'
+    if (r >= 4) return 'text-orange-400 bg-orange-500/20 border-orange-500/30'
+    return 'text-red-400 bg-red-500/20 border-red-500/30'
+  }
+  
+  const getRatingLabel = (r) => {
+    if (r >= 9) return 'Excellent'
+    if (r >= 7) return 'Good'
+    if (r >= 5) return 'Needs Work'
+    if (r >= 3) return 'Developing'
+    return 'Focus on Fundamentals'
+  }
+  
+  return (
+    <div className={clsx(
+      'flex items-center gap-4 p-4 rounded-xl border mb-4',
+      getRatingColor(rating)
+    )}>
+      <div className="flex items-center gap-2">
+        <Star className="w-6 h-6" />
+        <span className="text-3xl font-bold">{rating}/10</span>
+      </div>
+      <div className="flex-1">
+        <div className="font-semibold">{getRatingLabel(rating)}</div>
+        {explanation && (
+          <p className="text-sm opacity-80">{explanation}</p>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// Activity warning component
+function ActivityWarning({ percentActive, percentInactive, warning }) {
+  if (percentActive >= 50 && !warning) return null
+  
+  return (
+    <div className="flex items-center gap-3 p-3 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-400 mb-4">
+      <Activity className="w-5 h-5 flex-shrink-0" />
+      <div className="flex-1">
+        <div className="text-sm font-medium">
+          {warning || `Only ${percentActive?.toFixed(0)}% active wrestling detected`}
+        </div>
+        <div className="text-xs text-amber-400/70">
+          {percentInactive?.toFixed(0)}% of frames appear to be standing/reset time
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // Collapsible Analysis Card component
 function AnalysisCard({ analysis, index, isExpanded, onToggle, apiBase, isLatest }) {
   const [copiedSpeech, setCopiedSpeech] = useState(false)
@@ -203,6 +261,12 @@ function AnalysisCard({ analysis, index, isExpanded, onToggle, apiBase, isLatest
   const tipCount = analysis.pointers?.length || 0
   const eventCount = analysis.events?.length || 0
   const duration = formatDuration(analysis.duration_analyzed)
+  const rating = analysis.rating
+  const ratingExplanation = analysis.rating_explanation
+  const percentActive = analysis.percent_active_frames
+  const percentInactive = analysis.percent_inactive_frames
+  const activityWarning = analysis.activity_warning
+  const skillLevel = analysis.skill_level
   
   const handleCopySpeech = async () => {
     if (analysis.coach_speech) {
@@ -257,10 +321,21 @@ function AnalysisCard({ analysis, index, isExpanded, onToggle, apiBase, isLatest
             {index + 1}
           </div>
           <div className="text-left">
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <h3 className="font-semibold text-white">
                 Clip {index + 1}
               </h3>
+              {rating !== undefined && (
+                <span className={clsx(
+                  'px-2 py-0.5 text-xs rounded-full font-bold flex items-center gap-1',
+                  rating >= 7 ? 'bg-green-500/20 text-green-400' :
+                  rating >= 5 ? 'bg-amber-500/20 text-amber-400' :
+                  'bg-red-500/20 text-red-400'
+                )}>
+                  <Star className="w-3 h-3" />
+                  {rating}/10
+                </span>
+              )}
               {analysis.isContinuation && (
                 <span className="px-2 py-0.5 bg-purple-500/20 text-purple-400 text-xs rounded-full">
                   Continuation
@@ -269,6 +344,11 @@ function AnalysisCard({ analysis, index, isExpanded, onToggle, apiBase, isLatest
               {isLatest && (
                 <span className="px-2 py-0.5 bg-brand-500/20 text-brand-400 text-xs rounded-full">
                   Latest
+                </span>
+              )}
+              {skillLevel && (
+                <span className="px-2 py-0.5 bg-dark-700 text-dark-300 text-xs rounded-full capitalize">
+                  {skillLevel}
                 </span>
               )}
             </div>
@@ -297,6 +377,20 @@ function AnalysisCard({ analysis, index, isExpanded, onToggle, apiBase, isLatest
             className="overflow-hidden"
           >
             <div className="px-4 sm:px-6 pb-6 space-y-8 border-t border-dark-700 pt-6">
+              {/* Rating Display */}
+              {rating !== undefined && (
+                <RatingDisplay rating={rating} explanation={ratingExplanation} />
+              )}
+              
+              {/* Activity Warning */}
+              {(percentActive < 50 || activityWarning) && (
+                <ActivityWarning 
+                  percentActive={percentActive}
+                  percentInactive={percentInactive}
+                  warning={activityWarning}
+                />
+              )}
+              
               {/* Tips Section */}
               {analysis.pointers?.length > 0 && (
                 <div>
@@ -510,13 +604,35 @@ function generateClipReport(analysis, index) {
   `
 }
 
-export default function ResultsStep({ session, apiBase, onUploadAnother, onUploadContinuation }) {
+export default function ResultsStep({ 
+  session, 
+  apiBase, 
+  onUploadAnother, 
+  onUploadContinuation,
+  onInlineUpload,
+  isUploading 
+}) {
   const [expandedCards, setExpandedCards] = useState(() => {
     // By default, expand the latest card
     const lastIndex = session.analyses.length - 1
     return new Set([lastIndex])
   })
+  const [uploaderExpanded, setUploaderExpanded] = useState(false)
   const latestRef = useRef(null)
+  
+  // Handle inline upload
+  const handleInlineUpload = (file, isContinuation) => {
+    if (onInlineUpload) {
+      onInlineUpload(file, isContinuation)
+    } else {
+      // Fallback to old behavior
+      if (isContinuation) {
+        onUploadContinuation?.()
+      } else {
+        onUploadAnother?.()
+      }
+    }
+  }
   
   const toggleCard = (index) => {
     setExpandedCards(prev => {
@@ -616,52 +732,13 @@ export default function ResultsStep({ session, apiBase, onUploadAnother, onUploa
         ))}
       </div>
       
-      {/* Action Buttons */}
-      <motion.div
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ delay: 0.3 }}
-        className="border-t border-dark-700 pt-8"
-      >
-        <h3 className="text-lg font-semibold text-white mb-4">Continue Analyzing</h3>
-        <div className="grid gap-4 sm:grid-cols-2">
-          {/* Upload Another (New Analysis) */}
-          <motion.button
-            whileHover={{ scale: 1.02 }}
-            whileTap={{ scale: 0.98 }}
-            onClick={onUploadAnother}
-            className="flex items-center gap-4 p-4 rounded-xl border border-dark-700 bg-dark-900/50 hover:bg-dark-800/50 transition-colors text-left"
-          >
-            <div className="w-12 h-12 rounded-xl bg-brand-500/20 flex items-center justify-center flex-shrink-0">
-              <Plus className="w-6 h-6 text-brand-400" />
-            </div>
-            <div>
-              <h4 className="font-semibold text-white">Upload Another</h4>
-              <p className="text-dark-400 text-sm mt-0.5">
-                Start a new, unrelated analysis
-              </p>
-            </div>
-          </motion.button>
-          
-          {/* Upload Continuation */}
-          <motion.button
-            whileHover={{ scale: 1.02 }}
-            whileTap={{ scale: 0.98 }}
-            onClick={onUploadContinuation}
-            className="flex items-center gap-4 p-4 rounded-xl border border-purple-500/30 bg-purple-500/5 hover:bg-purple-500/10 transition-colors text-left"
-          >
-            <div className="w-12 h-12 rounded-xl bg-purple-500/20 flex items-center justify-center flex-shrink-0">
-              <Repeat className="w-6 h-6 text-purple-400" />
-            </div>
-            <div>
-              <h4 className="font-semibold text-white">Upload Next Part</h4>
-              <p className="text-purple-300/70 text-sm mt-0.5">
-                Continue the same match
-              </p>
-            </div>
-          </motion.button>
-        </div>
-      </motion.div>
+      {/* Inline Uploader */}
+      <InlineUploader
+        onUpload={handleInlineUpload}
+        isUploading={isUploading}
+        isExpanded={uploaderExpanded}
+        onToggleExpand={() => setUploaderExpanded(!uploaderExpanded)}
+      />
     </motion.div>
   )
 }
