@@ -1,13 +1,19 @@
 import { useState, useRef, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Upload, FileVideo, X, AlertCircle, CheckCircle2, Film } from 'lucide-react'
+import { Upload, FileVideo, X, AlertCircle, CheckCircle2, Film, ArrowLeft, Repeat } from 'lucide-react'
 import clsx from 'clsx'
 
 const MAX_FILE_SIZE = 500 * 1024 * 1024 // 500MB
 const VALID_EXTENSIONS = ['mp4', 'mov', 'avi', 'mkv', 'webm']
 const VALID_TYPES = ['video/mp4', 'video/quicktime', 'video/x-msvideo', 'video/x-matroska', 'video/webm']
 
-export default function UploadStep({ onUpload, isUploading }) {
+export default function UploadStep({ 
+  onUpload, 
+  isUploading, 
+  isContinuationMode = false,
+  hasExistingAnalyses = false,
+  onBackToResults
+}) {
   const [file, setFile] = useState(null)
   const [isDragging, setIsDragging] = useState(false)
   const [error, setError] = useState(null)
@@ -119,6 +125,40 @@ export default function UploadStep({ onUpload, isUploading }) {
       exit={{ opacity: 0, y: -20 }}
       className="max-w-2xl mx-auto"
     >
+      {/* Back to Results button (when we have existing analyses) */}
+      {hasExistingAnalyses && (
+        <motion.button
+          initial={{ opacity: 0, x: -10 }}
+          animate={{ opacity: 1, x: 0 }}
+          onClick={onBackToResults}
+          className="flex items-center gap-2 text-dark-400 hover:text-white mb-6 transition-colors"
+        >
+          <ArrowLeft className="w-4 h-4" />
+          Back to Results
+        </motion.button>
+      )}
+
+      {/* Continuation Mode Banner */}
+      {isContinuationMode && (
+        <motion.div
+          initial={{ opacity: 0, y: -10 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="mb-6 p-4 rounded-xl bg-purple-500/10 border border-purple-500/30"
+        >
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-lg bg-purple-500/20 flex items-center justify-center">
+              <Repeat className="w-5 h-5 text-purple-400" />
+            </div>
+            <div>
+              <h3 className="font-semibold text-purple-300">Continuation Mode</h3>
+              <p className="text-purple-300/70 text-sm">
+                This clip will be analyzed as the next part of the same match
+              </p>
+            </div>
+          </div>
+        </motion.div>
+      )}
+
       {/* Hero Section */}
       <div className="text-center mb-8">
         <motion.h2 
@@ -127,7 +167,12 @@ export default function UploadStep({ onUpload, isUploading }) {
           animate={{ opacity: 1, y: 0 }}
           transition={{ delay: 0.1 }}
         >
-          Upload Your Wrestling Footage
+          {isContinuationMode 
+            ? 'Upload Next Clip' 
+            : hasExistingAnalyses 
+              ? 'Upload Another Video'
+              : 'Upload Your Wrestling Footage'
+          }
         </motion.h2>
         <motion.p 
           className="text-dark-400 text-lg"
@@ -135,7 +180,10 @@ export default function UploadStep({ onUpload, isUploading }) {
           animate={{ opacity: 1 }}
           transition={{ delay: 0.2 }}
         >
-          Get AI-powered technique analysis in seconds
+          {isContinuationMode 
+            ? 'Continue where you left off'
+            : 'Get AI-powered technique analysis in seconds'
+          }
         </motion.p>
       </div>
 
@@ -172,10 +220,14 @@ export default function UploadStep({ onUpload, isUploading }) {
         className={clsx(
           'relative rounded-2xl border-2 border-dashed transition-all duration-300 cursor-pointer overflow-hidden',
           isDragging
-            ? 'border-brand-500 bg-brand-500/10 scale-[1.02]'
+            ? isContinuationMode 
+              ? 'border-purple-500 bg-purple-500/10 scale-[1.02]'
+              : 'border-brand-500 bg-brand-500/10 scale-[1.02]'
             : file
               ? 'border-green-500/50 bg-green-500/5 cursor-default'
-              : 'border-dark-600 bg-dark-900/50 hover:border-brand-500/50 hover:bg-dark-800/50'
+              : isContinuationMode
+                ? 'border-purple-500/30 bg-purple-500/5 hover:border-purple-500/50 hover:bg-purple-500/10'
+                : 'border-dark-600 bg-dark-900/50 hover:border-brand-500/50 hover:bg-dark-800/50'
         )}
       >
         <input
@@ -255,11 +307,16 @@ export default function UploadStep({ onUpload, isUploading }) {
             >
               <motion.div
                 animate={isDragging ? { scale: 1.1, rotate: 5 } : { scale: 1, rotate: 0 }}
-                className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-brand-500/10 mb-6"
+                className={clsx(
+                  'inline-flex items-center justify-center w-16 h-16 rounded-2xl mb-6',
+                  isContinuationMode ? 'bg-purple-500/10' : 'bg-brand-500/10'
+                )}
               >
                 <Upload className={clsx(
                   'w-8 h-8 transition-colors',
-                  isDragging ? 'text-brand-400' : 'text-brand-500'
+                  isDragging 
+                    ? isContinuationMode ? 'text-purple-400' : 'text-brand-400'
+                    : isContinuationMode ? 'text-purple-500' : 'text-brand-500'
                 )} />
               </motion.div>
               
@@ -267,7 +324,12 @@ export default function UploadStep({ onUpload, isUploading }) {
                 {isDragging ? 'Drop your video here' : 'Drag & drop your video'}
               </h3>
               <p className="text-dark-400 mb-4">
-                or <span className="text-brand-400 hover:text-brand-300 cursor-pointer">browse files</span>
+                or <span className={clsx(
+                  'cursor-pointer',
+                  isContinuationMode 
+                    ? 'text-purple-400 hover:text-purple-300' 
+                    : 'text-brand-400 hover:text-brand-300'
+                )}>browse files</span>
               </p>
               <p className="text-dark-500 text-sm">
                 Supports MP4, MOV, AVI, MKV, WebM • Max 500MB
@@ -281,9 +343,14 @@ export default function UploadStep({ onUpload, isUploading }) {
           <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
-            className="absolute inset-0 border-2 border-brand-500 rounded-2xl pointer-events-none"
+            className={clsx(
+              'absolute inset-0 border-2 rounded-2xl pointer-events-none',
+              isContinuationMode ? 'border-purple-500' : 'border-brand-500'
+            )}
             style={{
-              background: 'linear-gradient(90deg, transparent, rgba(99, 102, 241, 0.1), transparent)',
+              background: isContinuationMode 
+                ? 'linear-gradient(90deg, transparent, rgba(168, 85, 247, 0.1), transparent)'
+                : 'linear-gradient(90deg, transparent, rgba(99, 102, 241, 0.1), transparent)',
               backgroundSize: '200% 100%',
               animation: 'shimmer 1.5s infinite',
             }}
@@ -306,7 +373,9 @@ export default function UploadStep({ onUpload, isUploading }) {
           className={clsx(
             'flex items-center gap-2 px-8 py-3 rounded-xl font-semibold text-base transition-all',
             file && !isUploading
-              ? 'bg-gradient-to-r from-brand-600 to-purple-600 text-white shadow-lg shadow-brand-500/25 hover:shadow-brand-500/40'
+              ? isContinuationMode
+                ? 'bg-gradient-to-r from-purple-600 to-pink-600 text-white shadow-lg shadow-purple-500/25 hover:shadow-purple-500/40'
+                : 'bg-gradient-to-r from-brand-600 to-purple-600 text-white shadow-lg shadow-brand-500/25 hover:shadow-brand-500/40'
               : 'bg-dark-700 text-dark-400 cursor-not-allowed'
           )}
         >
@@ -322,37 +391,39 @@ export default function UploadStep({ onUpload, isUploading }) {
           ) : (
             <>
               <FileVideo className="w-5 h-5" />
-              Start Analysis
+              {isContinuationMode ? 'Continue Analysis' : 'Start Analysis'}
             </>
           )}
         </motion.button>
       </motion.div>
 
-      {/* Features Grid */}
-      <motion.div 
-        className="mt-12 grid grid-cols-1 sm:grid-cols-3 gap-4"
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ delay: 0.4 }}
-      >
-        {[
-          { icon: '🎯', title: 'Target Tracking', desc: 'AI follows your movement' },
-          { icon: '📐', title: 'Pose Analysis', desc: 'Joint angles & posture' },
-          { icon: '💡', title: 'Smart Tips', desc: 'Actionable coaching advice' },
-        ].map((feature, i) => (
-          <motion.div
-            key={feature.title}
-            initial={{ opacity: 0, y: 10 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: 0.5 + i * 0.1 }}
-            className="text-center p-4 rounded-xl bg-dark-900/50 border border-dark-800"
-          >
-            <span className="text-2xl mb-2 block">{feature.icon}</span>
-            <h4 className="text-white font-medium text-sm">{feature.title}</h4>
-            <p className="text-dark-500 text-xs mt-1">{feature.desc}</p>
-          </motion.div>
-        ))}
-      </motion.div>
+      {/* Features Grid (only show on fresh start) */}
+      {!hasExistingAnalyses && (
+        <motion.div 
+          className="mt-12 grid grid-cols-1 sm:grid-cols-3 gap-4"
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.4 }}
+        >
+          {[
+            { icon: '🎯', title: 'Target Tracking', desc: 'AI follows your movement' },
+            { icon: '📐', title: 'Pose Analysis', desc: 'Joint angles & posture' },
+            { icon: '💡', title: 'Smart Tips', desc: 'Actionable coaching advice' },
+          ].map((feature, i) => (
+            <motion.div
+              key={feature.title}
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.5 + i * 0.1 }}
+              className="text-center p-4 rounded-xl bg-dark-900/50 border border-dark-800"
+            >
+              <span className="text-2xl mb-2 block">{feature.icon}</span>
+              <h4 className="text-white font-medium text-sm">{feature.title}</h4>
+              <p className="text-dark-500 text-xs mt-1">{feature.desc}</p>
+            </motion.div>
+          ))}
+        </motion.div>
+      )}
     </motion.div>
   )
 }

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { AnimatePresence } from 'framer-motion'
 
 import Header from './components/Header'
@@ -13,7 +13,7 @@ const API_BASE = 'http://localhost:8000'
 
 // Local storage keys
 const STORAGE_KEYS = {
-  RESULTS: 'wrestlerAI-results',
+  SESSION: 'wrestlerAI-session',
   UPLOAD_DATA: 'wrestlerAI-uploadData',
   LAST_TARGET: 'wrestlerAI-lastTarget',
 }
@@ -27,20 +27,70 @@ const STATES = {
   RESULTS: 'results'
 }
 
+/**
+ * Session state structure:
+ * {
+ *   analyses: Array<AnalysisResult>,       // All completed analyses in order
+ *   currentMode: "new" | "continuation",   // Mode for next upload
+ *   matchContext: {                        // Accumulated context for continuation mode
+ *     totalShotAttempts: number,
+ *     totalLevelChanges: number,
+ *     totalSprawls: number,
+ *     recurringIssues: { [tipTitle: string]: number },
+ *     clipsSummary: string,
+ *     lastClipIndex: number
+ *   }
+ * }
+ */
+
+/**
+ * AnalysisResult structure:
+ * {
+ *   clipIndex: number,
+ *   timestamp: string (ISO),
+ *   isContinuation: boolean,
+ *   pointers: Array<Pointer>,
+ *   metrics: object,
+ *   timeline: Array<TimelineEvent>,
+ *   events: Array<WrestlingEvent>,
+ *   coach_speech: string,
+ *   annotated_video_url: string,
+ *   job_id: string,
+ *   duration_analyzed: number (seconds)
+ * }
+ */
+
+function getInitialSession() {
+  const cached = localStorage.getItem(STORAGE_KEYS.SESSION)
+  if (cached) {
+    try {
+      return JSON.parse(cached)
+    } catch (e) {
+      localStorage.removeItem(STORAGE_KEYS.SESSION)
+    }
+  }
+  return {
+    analyses: [],
+    currentMode: 'new',
+    matchContext: {
+      totalShotAttempts: 0,
+      totalLevelChanges: 0,
+      totalSprawls: 0,
+      recurringIssues: {},
+      clipsSummary: '',
+      lastClipIndex: 0
+    }
+  }
+}
+
 function App() {
+  // Session state (persisted)
+  const [session, setSession] = useState(getInitialSession)
+  
   // App state
   const [appState, setAppState] = useState(() => {
-    // Check if we have cached results
-    const cachedResults = localStorage.getItem(STORAGE_KEYS.RESULTS)
-    if (cachedResults) {
-      try {
-        JSON.parse(cachedResults)
-        return STATES.RESULTS
-      } catch (e) {
-        localStorage.removeItem(STORAGE_KEYS.RESULTS)
-      }
-    }
-    return STATES.UPLOAD
+    const initialSession = getInitialSession()
+    return initialSession.analyses.length > 0 ? STATES.RESULTS : STATES.UPLOAD
   })
 
   // Upload state
@@ -51,19 +101,6 @@ function App() {
         return JSON.parse(cached)
       } catch (e) {
         localStorage.removeItem(STORAGE_KEYS.UPLOAD_DATA)
-      }
-    }
-    return null
-  })
-
-  // Results state
-  const [results, setResults] = useState(() => {
-    const cached = localStorage.getItem(STORAGE_KEYS.RESULTS)
-    if (cached) {
-      try {
-        return JSON.parse(cached)
-      } catch (e) {
-        localStorage.removeItem(STORAGE_KEYS.RESULTS)
       }
     }
     return null
@@ -91,12 +128,13 @@ function App() {
     return null
   })
 
-  // Persist results to localStorage
+  // Mode for current/pending upload
+  const pendingModeRef = useRef('new')
+
+  // Persist session to localStorage
   useEffect(() => {
-    if (results) {
-      localStorage.setItem(STORAGE_KEYS.RESULTS, JSON.stringify(results))
-    }
-  }, [results])
+    localStorage.setItem(STORAGE_KEYS.SESSION, JSON.stringify(session))
+  }, [session])
 
   // Persist upload data
   useEffect(() => {
@@ -111,6 +149,84 @@ function App() {
       localStorage.setItem(STORAGE_KEYS.LAST_TARGET, JSON.stringify(lastTarget))
     }
   }, [lastTarget])
+
+  // Build prior context from last analysis for continuation mode
+  const buildPriorContext = useCallback(() => {
+    if (session.analyses.length === 0) return null
+    
+    const lastAnalysis = session.analyses[session.analyses.length - 1]
+    const context = session.matchContext
+    
+    return {
+      // From last analysis
+      lastTips: lastAnalysis.pointers?.slice(0, 3).map(p => ({
+        title: p.title,
+        evidence: p.evidence
+      })) || [],
+      lastEvents: lastAnalysis.events?.map(e => ({
+        type: e.type,
+        timestamp: e.t_start
+      })) || [],
+      lastMetrics: {
+        knee_angle_avg: lastAnalysis.metrics?.knee_angle?.avg,
+        stance_width_avg: lastAnalysis.metrics?.stance_width?.avg
+      },
+      coachSpeechSummary: lastAnalysis.coach_speech?.slice(0, 200) || '',
+      
+      // Accumulated context
+      totalShotAttempts: context.totalShotAttempts,
+      totalLevelChanges: context.totalLevelChanges,
+      totalSprawls: context.totalSprawls,
+      recurringIssues: context.recurringIssues,
+      clipNumber: context.lastClipIndex + 1
+    }
+  }, [session])
+
+  // Update match context after analysis
+  const updateMatchContext = useCallback((analysisResult, isContinuation) => {
+    setSession(prev => {
+      const newContext = { ...prev.matchContext }
+      
+      // Count events from this analysis
+      const events = analysisResult.events || []
+      const shotAttempts = events.filter(e => 
+        e.type?.toLowerCase().includes('shot') || 
+        e.type?.toLowerCase().includes('takedown')
+      ).length
+      const levelChanges = events.filter(e => 
+        e.type?.toLowerCase().includes('level')
+      ).length
+      const sprawls = events.filter(e => 
+        e.type?.toLowerCase().includes('sprawl')
+      ).length
+      
+      // Update totals
+      newContext.totalShotAttempts += shotAttempts
+      newContext.totalLevelChanges += levelChanges
+      newContext.totalSprawls += sprawls
+      
+      // Track recurring issues
+      const pointers = analysisResult.pointers || []
+      pointers.forEach(p => {
+        const key = p.title?.toLowerCase() || ''
+        if (key) {
+          newContext.recurringIssues[key] = (newContext.recurringIssues[key] || 0) + 1
+        }
+      })
+      
+      // Update clip index
+      newContext.lastClipIndex = prev.matchContext.lastClipIndex + 1
+      
+      // Build clips summary
+      const clipCount = newContext.lastClipIndex
+      newContext.clipsSummary = `Analyzed ${clipCount} clip${clipCount > 1 ? 's' : ''} in this session.`
+      
+      return {
+        ...prev,
+        matchContext: newContext
+      }
+    })
+  }, [])
 
   // Handle file upload
   const handleUpload = async (file) => {
@@ -158,16 +274,28 @@ function App() {
     setAnalyzeStarted(true)
     setAnalyzeComplete(false)
 
+    const isContinuation = pendingModeRef.current === 'continuation'
+    const clipIndex = session.matchContext.lastClipIndex + 1
+
     try {
+      const requestBody = {
+        target_box: targetBox,
+        t_start: tStart,
+        continuation: isContinuation,
+        clip_index: clipIndex
+      }
+
+      // Add prior context if in continuation mode
+      if (isContinuation) {
+        requestBody.prior_context = buildPriorContext()
+      }
+
       const response = await fetch(`${API_BASE}/api/analyze/${uploadData.job_id}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          target_box: targetBox,
-          t_start: tStart
-        }),
+        body: JSON.stringify(requestBody),
       })
 
       if (!response.ok) {
@@ -176,12 +304,32 @@ function App() {
       }
 
       const data = await response.json()
-      setResults(data)
+      
+      // Build analysis result with metadata
+      const analysisResult = {
+        ...data,
+        clipIndex,
+        timestamp: new Date().toISOString(),
+        isContinuation,
+        duration_analyzed: uploadData.duration_seconds || 0
+      }
+      
+      // Append to session analyses (don't replace!)
+      setSession(prev => ({
+        ...prev,
+        analyses: [...prev.analyses, analysisResult]
+      }))
+      
+      // Update match context
+      updateMatchContext(analysisResult, isContinuation)
+      
       setAnalyzeComplete(true)
       
       // Small delay to show completion state
       setTimeout(() => {
         setAppState(STATES.RESULTS)
+        // Reset mode back to new for next upload
+        pendingModeRef.current = 'new'
       }, 1500)
     } catch (err) {
       setError(err.message || 'Failed to analyze video.')
@@ -254,11 +402,42 @@ function App() {
     setError(null)
   }
 
-  // Start new analysis (clear everything)
-  const handleNewAnalysis = () => {
+  // Clear chat - wipe everything and start fresh
+  const handleClearChat = () => {
     setAppState(STATES.UPLOAD)
     setUploadData(null)
-    setResults(null)
+    setError(null)
+    setIsUploading(false)
+    setUploadComplete(false)
+    setAnalyzeStarted(false)
+    setAnalyzeComplete(false)
+    setLastTarget(null)
+    pendingModeRef.current = 'new'
+    
+    // Reset session to initial state
+    setSession({
+      analyses: [],
+      currentMode: 'new',
+      matchContext: {
+        totalShotAttempts: 0,
+        totalLevelChanges: 0,
+        totalSprawls: 0,
+        recurringIssues: {},
+        clipsSummary: '',
+        lastClipIndex: 0
+      }
+    })
+    
+    // Clear all localStorage
+    localStorage.removeItem(STORAGE_KEYS.SESSION)
+    localStorage.removeItem(STORAGE_KEYS.UPLOAD_DATA)
+    localStorage.removeItem(STORAGE_KEYS.LAST_TARGET)
+  }
+
+  // Logo click - go to home/upload without wiping analyses
+  const handleLogoClick = () => {
+    setAppState(STATES.UPLOAD)
+    setUploadData(null)
     setError(null)
     setIsUploading(false)
     setUploadComplete(false)
@@ -266,33 +445,55 @@ function App() {
     setAnalyzeComplete(false)
     setLastTarget(null)
     
-    // Clear localStorage
-    localStorage.removeItem(STORAGE_KEYS.RESULTS)
+    // Clear upload-related localStorage but keep session
     localStorage.removeItem(STORAGE_KEYS.UPLOAD_DATA)
     localStorage.removeItem(STORAGE_KEYS.LAST_TARGET)
   }
 
-  // Navigation handler
-  const handleNavigate = (destination) => {
-    if (destination === 'upload') {
-      handleNewAnalysis()
-    } else if (destination === 'results' && results) {
-      setAppState(STATES.RESULTS)
-    }
+  // Upload another (new, unrelated analysis)
+  const handleUploadAnother = () => {
+    pendingModeRef.current = 'new'
+    setAppState(STATES.UPLOAD)
+    setUploadData(null)
+    setError(null)
+    setIsUploading(false)
+    setUploadComplete(false)
+    setAnalyzeStarted(false)
+    setAnalyzeComplete(false)
+    setLastTarget(null)
+    
+    localStorage.removeItem(STORAGE_KEYS.UPLOAD_DATA)
+    localStorage.removeItem(STORAGE_KEYS.LAST_TARGET)
   }
 
-  // Determine current step for header
-  const getCurrentStep = () => {
-    if (appState === STATES.RESULTS) return 'results'
-    return 'upload'
+  // Upload continuation (next part of same match)
+  const handleUploadContinuation = () => {
+    pendingModeRef.current = 'continuation'
+    setAppState(STATES.UPLOAD)
+    setUploadData(null)
+    setError(null)
+    setIsUploading(false)
+    setUploadComplete(false)
+    setAnalyzeStarted(false)
+    setAnalyzeComplete(false)
+    setLastTarget(null)
+    
+    localStorage.removeItem(STORAGE_KEYS.UPLOAD_DATA)
+    localStorage.removeItem(STORAGE_KEYS.LAST_TARGET)
+  }
+
+  // Go back to results (if we have any)
+  const handleBackToResults = () => {
+    if (session.analyses.length > 0) {
+      setAppState(STATES.RESULTS)
+    }
   }
 
   return (
     <div className="min-h-screen bg-dark-950">
       <Header 
-        currentStep={getCurrentStep()}
-        onNavigate={handleNavigate}
-        hasResults={!!results}
+        onLogoClick={handleLogoClick}
+        onClearChat={handleClearChat}
       />
 
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 sm:py-12">
@@ -303,6 +504,9 @@ function App() {
               key="upload"
               onUpload={handleUpload}
               isUploading={isUploading}
+              isContinuationMode={pendingModeRef.current === 'continuation'}
+              hasExistingAnalyses={session.analyses.length > 0}
+              onBackToResults={handleBackToResults}
             />
           )}
 
@@ -323,7 +527,7 @@ function App() {
               key="target"
               uploadData={uploadData}
               onAnalyze={handleAnalyze}
-              onBack={handleNewAnalysis}
+              onBack={handleLogoClick}
               apiBase={API_BASE}
             />
           )}
@@ -341,12 +545,13 @@ function App() {
           )}
 
           {/* Results Step */}
-          {appState === STATES.RESULTS && results && (
+          {appState === STATES.RESULTS && session.analyses.length > 0 && (
             <ResultsStep
               key="results"
-              results={results}
+              session={session}
               apiBase={API_BASE}
-              onNewAnalysis={handleNewAnalysis}
+              onUploadAnother={handleUploadAnother}
+              onUploadContinuation={handleUploadContinuation}
             />
           )}
         </AnimatePresence>
