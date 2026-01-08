@@ -233,6 +233,52 @@ class AnalyzeWithAnchorsRequest(BaseModel):
     anchors: list[Anchor]
     continuation: bool = False
     prior_context: Optional[dict] = None
+    skill_level: Optional[str] = "intermediate"  # beginner, intermediate, advanced
+
+
+class TrimRequest(BaseModel):
+    """Request body for setting trim points"""
+    trim_start: float = 0.0
+    trim_end: float = 0.0
+
+
+def get_trim_metadata_path(job_id: str) -> Path:
+    """Get the path to trim metadata file for a job"""
+    return UPLOADS_DIR / f"{job_id}_trim.json"
+
+
+def get_trim_metadata(job_id: str) -> dict:
+    """
+    Load trim metadata for a job. Returns default values if not set.
+    """
+    trim_path = get_trim_metadata_path(job_id)
+    if trim_path.exists():
+        try:
+            with open(trim_path, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to read trim metadata for {job_id}: {e}")
+    return {"trim_start": 0.0, "trim_end": None, "effective_duration": None}
+
+
+def save_trim_metadata(job_id: str, trim_start: float, trim_end: float, duration: float) -> dict:
+    """
+    Save trim metadata for a job.
+    """
+    effective_duration = trim_end - trim_start
+    metadata = {
+        "trim_start": trim_start,
+        "trim_end": trim_end,
+        "effective_duration": effective_duration,
+        "original_duration": duration
+    }
+    
+    trim_path = get_trim_metadata_path(job_id)
+    with open(trim_path, 'w') as f:
+        json.dump(metadata, f)
+    
+    logger.info(f"Saved trim metadata for job {job_id}: {trim_start:.2f} - {trim_end:.2f}")
+    return metadata
 
 
 @app.get("/")
@@ -533,10 +579,64 @@ async def upload_video(file: UploadFile = File(...)):
     }
 
 
+@app.post("/api/set-trim/{job_id}")
+async def set_trim(job_id: str, request: TrimRequest):
+    """
+    Set trim points for a video.
+    
+    Args:
+        job_id: Job ID from /api/upload
+        request: JSON body with trim_start and trim_end in seconds
+    
+    Returns:
+        Trim metadata including effective_duration
+    """
+    # Validate job_id format
+    try:
+        uuid.UUID(job_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid job ID format")
+    
+    # Find uploaded file
+    input_path = find_upload_file(job_id)
+    
+    # Get video metadata
+    try:
+        metadata = get_video_metadata(str(input_path))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    
+    duration = metadata["duration_seconds"]
+    
+    # Validate trim points
+    trim_start = max(0.0, min(request.trim_start, duration))
+    trim_end = max(trim_start, min(request.trim_end, duration))
+    
+    # Ensure minimum clip length (3 seconds)
+    if trim_end - trim_start < 3.0:
+        # If requested range is too short, extend it
+        if trim_end < duration:
+            trim_end = min(trim_start + 3.0, duration)
+        else:
+            trim_start = max(0, trim_end - 3.0)
+    
+    # Save trim metadata
+    trim_metadata = save_trim_metadata(job_id, trim_start, trim_end, duration)
+    
+    return {
+        "job_id": job_id,
+        "trim_start": trim_start,
+        "trim_end": trim_end,
+        "effective_duration": trim_metadata["effective_duration"],
+        "original_duration": duration
+    }
+
+
 @app.get("/api/frame/{job_id}")
 async def get_frame(
     job_id: str,
-    t: float = Query(default=0, description="Timestamp in seconds")
+    t: float = Query(default=0, description="Timestamp in seconds (relative to trim start if trim is set)"),
+    use_trim: bool = Query(default=False, description="If true, t is relative to trim start; if false, t is absolute")
 ):
     """
     Get a JPEG image of the frame at timestamp t.
@@ -546,7 +646,9 @@ async def get_frame(
     
     Args:
         job_id: Job ID from /api/upload
-        t: Timestamp in seconds (clamped to [0, min(15, duration)])
+        t: Timestamp in seconds. If use_trim=True, this is relative to trim_start.
+           If use_trim=False, this is an absolute timestamp.
+        use_trim: Whether to apply trim offset to the timestamp
     
     Returns:
         JPEG image response
@@ -564,23 +666,38 @@ async def get_frame(
     try:
         metadata = get_video_metadata(str(input_path))
         duration = metadata["duration_seconds"]
-        max_t = min(MAX_SCRUB_SECONDS, duration)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"Failed to read video metadata: {str(e)}")
     
-    # Validate and clamp t to valid range [0, max_t]
-    if t < 0:
-        raise HTTPException(status_code=400, detail=f"Timestamp must be >= 0, got {t}")
+    # Get trim metadata if it exists
+    trim_meta = get_trim_metadata(job_id)
+    trim_start = trim_meta.get("trim_start", 0.0)
+    trim_end = trim_meta.get("trim_end") or duration
     
-    t = max(0, min(t, max_t))
+    # Calculate effective timestamp
+    if use_trim:
+        # t is relative to trim_start
+        effective_duration = trim_end - trim_start
+        t = max(0, min(t, effective_duration))
+        actual_t = trim_start + t
+    else:
+        # t is absolute timestamp (for preview during trim)
+        max_t = min(MAX_SCRUB_SECONDS, duration)
+        actual_t = max(0, min(t, max_t))
+    
+    # Validate timestamp
+    if actual_t < 0:
+        raise HTTPException(status_code=400, detail=f"Timestamp must be >= 0, got {actual_t}")
+    
+    actual_t = max(0, min(actual_t, duration))
     
     # Extract frame using FFmpeg with caching
-    cache_path = extract_frame_at_time(str(input_path), t, job_id, duration)
+    cache_path = extract_frame_at_time(str(input_path), actual_t, job_id, duration)
     
     if cache_path is None:
         raise HTTPException(
             status_code=500, 
-            detail=f"Failed to extract frame at t={t}s using FFmpeg"
+            detail=f"Failed to extract frame at t={actual_t}s using FFmpeg"
         )
     
     # Return the cached JPEG file
@@ -594,7 +711,8 @@ async def get_frame(
 @app.get("/api/boxes/{job_id}")
 async def get_boxes(
     job_id: str,
-    t: float = Query(default=0, description="Timestamp in seconds")
+    t: float = Query(default=0, description="Timestamp in seconds (relative to trim start if use_trim=True)"),
+    use_trim: bool = Query(default=True, description="If true, t is relative to trim start")
 ):
     """
     Get person detection boxes at timestamp t.
@@ -603,7 +721,8 @@ async def get_boxes(
     
     Args:
         job_id: Job ID from /api/upload
-        t: Timestamp in seconds (clamped to [0, min(15, duration)])
+        t: Timestamp in seconds. If use_trim=True, this is relative to trim_start.
+        use_trim: Whether to apply trim offset to the timestamp
     
     Returns:
         List of detection boxes: [{id, x, y, w, h, score}]
@@ -621,22 +740,36 @@ async def get_boxes(
     try:
         metadata = get_video_metadata(str(input_path))
         duration = metadata["duration_seconds"]
-        max_t = min(MAX_SCRUB_SECONDS, duration)
         width = metadata["width"]
         height = metadata["height"]
     except ValueError:
         raise HTTPException(status_code=500, detail="Failed to read video metadata")
     
-    # Clamp t to valid range
-    t = max(0, min(t, max_t))
+    # Get trim metadata if it exists
+    trim_meta = get_trim_metadata(job_id)
+    trim_start = trim_meta.get("trim_start", 0.0)
+    trim_end = trim_meta.get("trim_end") or duration
+    
+    # Calculate effective timestamp
+    if use_trim and trim_meta.get("trim_end") is not None:
+        # t is relative to trim_start
+        effective_duration = trim_end - trim_start
+        t = max(0, min(t, effective_duration))
+        actual_t = trim_start + t
+    else:
+        # t is absolute timestamp
+        max_t = min(MAX_SCRUB_SECONDS, duration)
+        actual_t = max(0, min(t, max_t))
+    
+    actual_t = max(0, min(actual_t, duration))
     
     # Extract frame using FFmpeg with caching (reuses cached frame if available)
-    cache_path = extract_frame_at_time(str(input_path), t, job_id, duration)
+    cache_path = extract_frame_at_time(str(input_path), actual_t, job_id, duration)
     
     if cache_path is None:
         raise HTTPException(
             status_code=500, 
-            detail=f"Failed to extract frame at t={t}s using FFmpeg"
+            detail=f"Failed to extract frame at t={actual_t}s using FFmpeg"
         )
     
     # Read the cached frame as numpy array for YOLO detection
@@ -661,24 +794,28 @@ async def get_boxes(
         "auto_target": auto_target,
         "frame_width": width,
         "frame_height": height,
-        "timestamp": t
+        "timestamp": t,
+        "actual_timestamp": actual_t
     }
 
 
 @app.get("/api/anchors/{job_id}")
 async def get_anchors(job_id: str):
     """
-    Generate anchor timestamps for a video based on duration.
+    Generate anchor timestamps for a video based on trimmed duration.
     
-    Always returns a SORTED list of timestamps, never exceeding duration.
+    Always returns a SORTED list of timestamps within the trimmed range.
+    Timestamps are relative to trim_start (i.e., 0 = trim_start in actual video).
     
     Args:
         job_id: Job ID from /api/upload
     
     Returns:
-        anchors: List of anchor timestamps in seconds (sorted, ascending)
+        anchors: List of anchor timestamps in seconds (relative to trim_start, sorted)
         count: Number of anchors
-        duration: Video duration in seconds
+        duration: Effective (trimmed) duration in seconds
+        trim_start: Start of trim in original video
+        trim_end: End of trim in original video
     """
     # Validate job_id format
     try:
@@ -695,27 +832,39 @@ async def get_anchors(job_id: str):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     
-    duration = metadata["duration_seconds"]
+    original_duration = metadata["duration_seconds"]
     
-    # Generate anchor timestamps
-    anchor_timestamps = generate_anchor_timestamps(duration)
+    # Get trim metadata
+    trim_meta = get_trim_metadata(job_id)
+    trim_start = trim_meta.get("trim_start", 0.0)
+    trim_end = trim_meta.get("trim_end") or original_duration
     
-    # Ensure anchors are sorted and clamped to [0, duration]
-    anchor_timestamps = sorted(set(anchor_timestamps))  # Sort and deduplicate
+    # Calculate effective duration
+    effective_duration = trim_end - trim_start
+    
+    # Generate anchor timestamps for the effective duration
+    # These are RELATIVE to trim_start (so 0 = trim_start in actual video)
+    anchor_timestamps = generate_anchor_timestamps(effective_duration)
+    
+    # Ensure anchors are sorted and clamped to [0, effective_duration]
+    anchor_timestamps = sorted(set(anchor_timestamps))
     anchor_timestamps = [
-        round(max(0.0, min(t, duration)), 2) 
+        round(max(0.0, min(t, effective_duration)), 2) 
         for t in anchor_timestamps
     ]
     
     # Remove any duplicates that may arise from clamping, keep sorted
     anchor_timestamps = sorted(set(anchor_timestamps))
     
-    logger.info(f"Generated {len(anchor_timestamps)} anchors for job {job_id}, duration={duration}s")
+    logger.info(f"Generated {len(anchor_timestamps)} anchors for job {job_id}, effective_duration={effective_duration}s (trim: {trim_start}-{trim_end})")
     
     return {
         "anchors": anchor_timestamps,
         "count": len(anchor_timestamps),
-        "duration": duration,
+        "duration": effective_duration,
+        "original_duration": original_duration,
+        "trim_start": trim_start,
+        "trim_end": trim_end,
         "fps": metadata["fps"],
         "width": metadata["width"],
         "height": metadata["height"]
@@ -847,6 +996,131 @@ async def analyze(job_id: str, request: AnalyzeRequest):
     return JSONResponse(content=response_payload)
 
 
+def compute_wrestler_rating(
+    skill_level: str,
+    pointers: list,
+    metrics: dict,
+    tracking_diagnostics: dict,
+    inactive_percent: float = 0.0
+) -> dict:
+    """
+    Compute a 1-10 wrestler rating based on skill level, mistakes, and coverage.
+    
+    Args:
+        skill_level: "beginner", "intermediate", or "advanced"
+        pointers: List of coaching tips (mistakes)
+        metrics: Analysis metrics
+        tracking_diagnostics: Tracking quality info
+        inactive_percent: Percentage of frames marked as inactive (standing)
+    
+    Returns:
+        Dict with rating (1-10), explanation, and breakdown
+    """
+    # Base score starts at 10 and gets reduced for issues
+    base_score = 10.0
+    
+    # Severity weights for issues
+    severity_weights = {
+        "high": 1.5,
+        "medium": 0.8,
+        "low": 0.4
+    }
+    
+    # Classify pointers by severity (based on common patterns)
+    high_severity_keywords = ["get lower", "stance", "hands up", "balance", "posture"]
+    medium_severity_keywords = ["circle", "reach", "trail leg", "head position", "elbow"]
+    low_severity_keywords = ["timing", "consistency", "level change"]
+    
+    high_count = 0
+    medium_count = 0
+    low_count = 0
+    
+    for pointer in pointers:
+        title = pointer.get("title", "").lower()
+        
+        if any(kw in title for kw in high_severity_keywords):
+            high_count += 1
+        elif any(kw in title for kw in medium_severity_keywords):
+            medium_count += 1
+        else:
+            low_count += 1
+    
+    # Calculate deductions based on skill level expectations
+    skill_multipliers = {
+        "beginner": 0.6,      # More lenient
+        "intermediate": 1.0,  # Standard
+        "advanced": 1.4       # Higher standards
+    }
+    multiplier = skill_multipliers.get(skill_level, 1.0)
+    
+    # Calculate total deduction
+    issue_deduction = (
+        high_count * severity_weights["high"] +
+        medium_count * severity_weights["medium"] +
+        low_count * severity_weights["low"]
+    ) * multiplier
+    
+    # Coverage/confidence penalty
+    coverage_percent = tracking_diagnostics.get("percent_frames_with_target", 100)
+    coverage_penalty = 0
+    if coverage_percent < 50:
+        coverage_penalty = 2.0
+    elif coverage_percent < 70:
+        coverage_penalty = 1.0
+    elif coverage_percent < 85:
+        coverage_penalty = 0.5
+    
+    # Inactive frames penalty (too much standing around)
+    inactive_penalty = 0
+    if inactive_percent > 50:
+        inactive_penalty = 1.5
+    elif inactive_percent > 30:
+        inactive_penalty = 0.8
+    elif inactive_percent > 15:
+        inactive_penalty = 0.3
+    
+    # Calculate final score
+    final_score = base_score - issue_deduction - coverage_penalty - inactive_penalty
+    
+    # Clamp to 1-10
+    final_score = max(1, min(10, round(final_score)))
+    
+    # Build explanation
+    explanation_parts = []
+    explanation_parts.append(f"Based on your selected level ({skill_level.title()})")
+    
+    if high_count > 0 or medium_count > 0 or low_count > 0:
+        issue_parts = []
+        if high_count > 0:
+            issue_parts.append(f"{high_count} major")
+        if medium_count > 0:
+            issue_parts.append(f"{medium_count} moderate")
+        if low_count > 0:
+            issue_parts.append(f"{low_count} minor")
+        explanation_parts.append(f"and {' + '.join(issue_parts)} issues detected")
+    
+    if coverage_penalty > 0:
+        explanation_parts.append(f"({coverage_percent:.0f}% tracking coverage)")
+    
+    if inactive_penalty > 0:
+        explanation_parts.append(f"({inactive_percent:.0f}% inactive frames)")
+    
+    return {
+        "rating": int(final_score),
+        "explanation": " ".join(explanation_parts) + ".",
+        "breakdown": {
+            "base_score": 10,
+            "issue_deduction": round(issue_deduction, 1),
+            "coverage_penalty": round(coverage_penalty, 1),
+            "inactive_penalty": round(inactive_penalty, 1),
+            "skill_multiplier": multiplier,
+            "high_severity_issues": high_count,
+            "medium_severity_issues": medium_count,
+            "low_severity_issues": low_count
+        }
+    }
+
+
 @app.post("/api/analyze-with-anchors/{job_id}")
 async def analyze_with_anchors(job_id: str, request: AnalyzeWithAnchorsRequest):
     """
@@ -857,6 +1131,7 @@ async def analyze_with_anchors(job_id: str, request: AnalyzeWithAnchorsRequest):
     overlaps or camera shake.
     
     Uses atomic output writing: writes to temp file, then renames atomically.
+    Applies trim offsets if set.
     
     Args:
         job_id: Job ID from /api/upload
@@ -864,6 +1139,7 @@ async def analyze_with_anchors(job_id: str, request: AnalyzeWithAnchorsRequest):
             - anchors: Array of {t: float, box: {x,y,w,h} | null, skipped: bool}
             - continuation: Optional bool for continuing prior analysis
             - prior_context: Optional object with prior analysis context
+            - skill_level: Optional skill level for rating calculation
     
     Returns:
         job_id: Same job ID
@@ -872,6 +1148,10 @@ async def analyze_with_anchors(job_id: str, request: AnalyzeWithAnchorsRequest):
         timeline: List of timestamped events
         events: Wrestling-specific events (shots, level changes, sprawls)
         tracking_diagnostics: {num_reacquires, num_segments_skipped, percent_frames_with_target}
+        rating: 1-10 wrestler rating
+        rating_explanation: Explanation of the rating
+        percent_inactive_frames: Percentage of frames marked as inactive (standing)
+        percent_active_frames: Percentage of frames with active wrestling
         annotated_video_url: URL to download annotated video
         output_ready: True if video is ready for download
         output_url: URL to download annotated video
@@ -895,19 +1175,29 @@ async def analyze_with_anchors(job_id: str, request: AnalyzeWithAnchorsRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     
-    duration = metadata["duration_seconds"]
+    original_duration = metadata["duration_seconds"]
+    
+    # Get trim metadata
+    trim_meta = get_trim_metadata(job_id)
+    trim_start = trim_meta.get("trim_start", 0.0)
+    trim_end = trim_meta.get("trim_end") or original_duration
+    effective_duration = trim_end - trim_start
     
     # Validate anchors
     if not request.anchors:
         raise HTTPException(status_code=400, detail="At least one anchor is required")
     
     # Convert Pydantic models to dicts and validate
-    # Also ensure anchors are sorted and within duration bounds
+    # Apply trim offset: anchor timestamps are relative to trim_start
     anchors_list = []
     prev_t = -1.0
     for anchor in request.anchors:
-        # Clamp anchor timestamp to [0, duration]
-        clamped_t = max(0.0, min(anchor.t, duration))
+        # Convert relative timestamp to absolute
+        # Anchor t is relative to trim_start, convert to absolute video time
+        absolute_t = trim_start + anchor.t
+        
+        # Clamp anchor timestamp to [trim_start, trim_end]
+        clamped_t = max(trim_start, min(absolute_t, trim_end))
         
         # Check sorted order (after clamping)
         if clamped_t <= prev_t and prev_t >= 0:
@@ -922,7 +1212,7 @@ async def analyze_with_anchors(job_id: str, request: AnalyzeWithAnchorsRequest):
         prev_t = clamped_t
         
         anchor_dict = {
-            "t": clamped_t,  # Use clamped value
+            "t": clamped_t,  # Use absolute timestamp
             "box": None,
             "skipped": anchor.skipped
         }
@@ -940,7 +1230,12 @@ async def analyze_with_anchors(job_id: str, request: AnalyzeWithAnchorsRequest):
     if not anchors_list:
         raise HTTPException(status_code=400, detail="No valid anchors after validation")
     
-    logger.info(f"Starting anchor-based analysis for job {job_id} with {len(anchors_list)} anchors")
+    # Get skill level for rating calculation
+    skill_level = request.skill_level or "intermediate"
+    if skill_level not in ["beginner", "intermediate", "advanced"]:
+        skill_level = "intermediate"
+    
+    logger.info(f"Starting anchor-based analysis for job {job_id} with {len(anchors_list)} anchors, skill_level={skill_level}, trim={trim_start}-{trim_end}")
     
     # Run anchor-based analysis (write to temp path)
     output_ready = False
@@ -948,7 +1243,10 @@ async def analyze_with_anchors(job_id: str, request: AnalyzeWithAnchorsRequest):
         result = analyze_video_with_anchors(
             str(input_path),
             str(temp_output_path),  # Write to temp path first
-            anchors=anchors_list
+            anchors=anchors_list,
+            skill_level=skill_level,
+            trim_start=trim_start,
+            trim_end=trim_end
         )
         
         # Atomic rename: only after VideoWriter.release() and file has content
@@ -971,6 +1269,19 @@ async def analyze_with_anchors(job_id: str, request: AnalyzeWithAnchorsRequest):
         logger.error(f"Analysis failed for job {job_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
     
+    # Get inactive frame percentage from result
+    inactive_percent = result.get("percent_inactive_frames", 0)
+    active_percent = result.get("percent_active_frames", 100)
+    
+    # Compute wrestler rating
+    rating_result = compute_wrestler_rating(
+        skill_level=skill_level,
+        pointers=result.get("pointers", []),
+        metrics=result.get("metrics", {}),
+        tracking_diagnostics=result.get("tracking_diagnostics", {}),
+        inactive_percent=inactive_percent
+    )
+    
     # Build response payload
     response_payload = {
         "job_id": job_id,
@@ -980,10 +1291,25 @@ async def analyze_with_anchors(job_id: str, request: AnalyzeWithAnchorsRequest):
         "events": result.get("events", []),
         "coach_speech": result.get("coach_speech", ""),
         "tracking_diagnostics": result.get("tracking_diagnostics", {}),
+        "rating": rating_result["rating"],
+        "rating_explanation": rating_result["explanation"],
+        "rating_breakdown": rating_result["breakdown"],
+        "percent_inactive_frames": round(inactive_percent, 1),
+        "percent_active_frames": round(active_percent, 1),
+        "skill_level": skill_level,
+        "trim_applied": {
+            "trim_start": trim_start,
+            "trim_end": trim_end,
+            "effective_duration": effective_duration
+        },
         "annotated_video_url": f"/api/output/{job_id}",
         "output_url": f"/api/output/{job_id}",
         "output_ready": output_ready
     }
+    
+    # Add low activity warning if needed
+    if active_percent < 50:
+        response_payload["activity_warning"] = "Large portion of clip appears non-wrestling (standing/reset). Consider trimming more aggressively."
     
     # Convert all numpy types to native Python types for JSON serialization
     response_payload = convert_numpy_types(response_payload)

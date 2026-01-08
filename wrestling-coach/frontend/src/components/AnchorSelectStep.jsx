@@ -12,7 +12,8 @@ import {
   SkipForward,
   CheckCircle2,
   Loader2,
-  Lock
+  Lock,
+  GraduationCap
 } from 'lucide-react'
 import clsx from 'clsx'
 
@@ -20,7 +21,9 @@ export default function AnchorSelectStep({
   uploadData,
   onAnalyze,
   onBack,
-  apiBase
+  apiBase,
+  skillLevel = 'intermediate',
+  onSkillLevelChange
 }) {
   // Anchor data
   const [anchorTimestamps, setAnchorTimestamps] = useState([])
@@ -83,11 +86,12 @@ export default function AnchorSelectStep({
   }
 
   // Fetch frame and boxes for a specific anchor
+  // Note: t is relative to trim_start (anchors are generated within trimmed duration)
   const fetchFrameAndBoxes = useCallback(async (jobId, t, anchorIdx) => {
     setLoadingFrame(true)
     try {
-      // Fetch frame image
-      const frameResponse = await fetch(`${apiBase}/api/frame/${jobId}?t=${t}`)
+      // Fetch frame image (use_trim=true so t is relative to trim start)
+      const frameResponse = await fetch(`${apiBase}/api/frame/${jobId}?t=${t}&use_trim=true`)
       if (frameResponse.ok) {
         const blob = await frameResponse.blob()
         const url = URL.createObjectURL(blob)
@@ -97,8 +101,8 @@ export default function AnchorSelectStep({
         setFrameUrl(url)
       }
       
-      // Fetch boxes
-      const boxesResponse = await fetch(`${apiBase}/api/boxes/${jobId}?t=${t}`)
+      // Fetch boxes (use_trim=true so t is relative to trim start)
+      const boxesResponse = await fetch(`${apiBase}/api/boxes/${jobId}?t=${t}&use_trim=true`)
       if (boxesResponse.ok) {
         const data = await boxesResponse.json()
         setBoxes(data.boxes || [])
@@ -211,18 +215,25 @@ export default function AnchorSelectStep({
   const getCurrentAnchor = () => anchors[currentAnchorIndex] || { t: 0, box: null, skipped: false }
   const currentAnchor = getCurrentAnchor()
 
-  // Check if ready to analyze (at least one anchor has a box)
+  // Check if ready to analyze
+  // If user has ANY selections, require at least 65% of anchors answered (box OR skipped)
   const hasAnySelection = anchors.some(a => a.box !== null)
   
-  // Count completed anchors
-  const completedCount = anchors.filter(a => a.box !== null || a.skipped).length
+  // Count completed anchors (answered = has box OR is skipped)
+  const answeredCount = anchors.filter(a => a.box !== null || a.skipped).length
   const progressPercent = anchorTimestamps.length > 0 
-    ? Math.round((completedCount / anchorTimestamps.length) * 100) 
+    ? Math.round((answeredCount / anchorTimestamps.length) * 100) 
     : 0
+  
+  // Require 65% of anchors to be answered before enabling Analyze
+  const REQUIRED_PERCENT = 65
+  const requiredCount = Math.ceil(anchorTimestamps.length * (REQUIRED_PERCENT / 100))
+  const hasEnoughAnswers = answeredCount >= requiredCount
+  const canAnalyze = hasAnySelection && hasEnoughAnswers
 
   // Handle analyze
   const handleAnalyze = () => {
-    if (hasAnySelection) {
+    if (canAnalyze) {
       onAnalyze(anchors)
     }
   }
@@ -269,21 +280,75 @@ export default function AnchorSelectStep({
         <div className="w-20" />
       </div>
 
+      {/* Skill Level Selector */}
+      <div className="mb-6 p-4 rounded-xl bg-dark-900/50 border border-dark-800">
+        <div className="flex items-center gap-3 mb-3">
+          <GraduationCap className="w-5 h-5 text-brand-400" />
+          <span className="font-medium text-white">Your Skill Level</span>
+          <span className="text-dark-500 text-sm">(affects rating expectations)</span>
+        </div>
+        <div className="grid grid-cols-3 gap-2">
+          {['beginner', 'intermediate', 'advanced'].map((level) => (
+            <button
+              key={level}
+              onClick={() => onSkillLevelChange?.(level)}
+              className={clsx(
+                'px-4 py-2 rounded-lg font-medium text-sm capitalize transition-all',
+                skillLevel === level
+                  ? level === 'beginner' 
+                    ? 'bg-green-500/20 text-green-400 border border-green-500/30'
+                    : level === 'intermediate'
+                      ? 'bg-brand-500/20 text-brand-400 border border-brand-500/30'
+                      : 'bg-purple-500/20 text-purple-400 border border-purple-500/30'
+                  : 'bg-dark-800 text-dark-400 hover:text-white hover:bg-dark-700 border border-dark-700'
+              )}
+            >
+              {level}
+            </button>
+          ))}
+        </div>
+      </div>
+
       {/* Progress Bar */}
       <div className="mb-6">
         <div className="flex items-center justify-between mb-2">
           <span className="text-dark-400 text-sm">
-            {completedCount} of {anchorTimestamps.length} anchors set
+            Answered {answeredCount}/{anchorTimestamps.length} anchors ({progressPercent}%)
+            {!hasEnoughAnswers && hasAnySelection && (
+              <span className="text-amber-400 ml-2">
+                • Need {REQUIRED_PERCENT}% to analyze
+              </span>
+            )}
           </span>
-          <span className="text-brand-400 text-sm font-medium">{progressPercent}%</span>
+          <span className={clsx(
+            'text-sm font-medium',
+            hasEnoughAnswers ? 'text-green-400' : 'text-brand-400'
+          )}>
+            {hasEnoughAnswers ? '✓ Ready' : `${requiredCount - answeredCount} more needed`}
+          </span>
         </div>
-        <div className="h-2 bg-dark-800 rounded-full overflow-hidden">
+        <div className="h-2 bg-dark-800 rounded-full overflow-hidden relative">
+          {/* 65% threshold marker */}
+          <div 
+            className="absolute top-0 bottom-0 w-0.5 bg-amber-500/50 z-10"
+            style={{ left: `${REQUIRED_PERCENT}%` }}
+          />
           <motion.div
-            className="h-full bg-gradient-to-r from-brand-600 to-purple-600"
+            className={clsx(
+              'h-full',
+              hasEnoughAnswers 
+                ? 'bg-gradient-to-r from-green-600 to-emerald-600'
+                : 'bg-gradient-to-r from-brand-600 to-purple-600'
+            )}
             initial={{ width: 0 }}
             animate={{ width: `${progressPercent}%` }}
             transition={{ duration: 0.3 }}
           />
+        </div>
+        <div className="flex justify-between text-xs text-dark-500 mt-1">
+          <span>0%</span>
+          <span className="text-amber-400">65% required</span>
+          <span>100%</span>
         </div>
       </div>
 
@@ -597,17 +662,17 @@ export default function AnchorSelectStep({
           whileHover={{ scale: 1.02 }}
           whileTap={{ scale: 0.98 }}
           onClick={handleAnalyze}
-          disabled={!hasAnySelection}
+          disabled={!canAnalyze}
           className={clsx(
             'flex items-center gap-2 px-8 py-3.5 rounded-xl font-semibold text-lg transition-all',
-            hasAnySelection
+            canAnalyze
               ? 'bg-gradient-to-r from-green-600 to-emerald-600 text-white shadow-lg shadow-green-500/25 hover:shadow-green-500/40'
               : 'bg-dark-700 text-dark-400 cursor-not-allowed'
           )}
         >
           <Play className="w-5 h-5" />
           Analyze Video
-          {hasAnySelection && (
+          {canAnalyze && (
             <span className="ml-2 px-2 py-0.5 bg-white/20 rounded-full text-sm">
               {anchors.filter(a => a.box).length} anchors
             </span>
@@ -617,8 +682,11 @@ export default function AnchorSelectStep({
 
       {/* Help text */}
       <p className="text-center text-dark-500 text-sm mt-4">
-        Select yourself at multiple timestamps for more accurate tracking. 
-        You can skip frames where you're not visible.
+        {!hasEnoughAnswers ? (
+          <>Answer at least {REQUIRED_PERCENT}% of anchors ({requiredCount} of {anchorTimestamps.length}) to enable analysis. "I'm not in frame" counts as answered.</>
+        ) : (
+          <>Select yourself at multiple timestamps for more accurate tracking. You can skip frames where you're not visible.</>
+        )}
       </p>
     </motion.div>
   )
